@@ -16,8 +16,12 @@
  *   Backspace     - Reset speed to 1.0x
  *   - / =         - Audio reactivity down / up
  *   0             - Reset audio reactivity to 1.0x
- *   Mouse drag    - Spawn/move touch waveforms
- *   Mouse click   - Create touch waveform
+ *   Mouse click   - Create touch waveform (persists after release)
+ *   Mouse drag    - Move touch waveform
+ *   Right-click   - Cycle waveform type
+ *   Scroll wheel  - Adjust touch pressure (0-2)
+ *   Shift+Scroll  - Cycle waveform type
+ *   C             - Clear all touch waveforms
  *   Escape / Q    - Quit
  */
 
@@ -76,8 +80,38 @@ static Uint32 g_lastFrameTicks  = 0;
 // Audio dampening - scales PCM amplitude before feeding to projectM
 static float  g_audioGain       = 1.0f;   // 0.0 (muted) to 3.0 (boosted)
 
-// Mouse interaction state
+// Mouse / touch waveform state
 static bool   g_mouseDown       = false;
+static int    g_touchPressure   = 1;      // 0 to 2 (low / medium / high)
+static int    g_touchTypeIndex  = 0;      // index into touch type list
+static constexpr projectm_touch_type g_touchTypes[] = {
+    PROJECTM_TOUCH_TYPE_RANDOM,
+    PROJECTM_TOUCH_TYPE_CIRCLE,
+    PROJECTM_TOUCH_TYPE_RADIAL_BLOB,
+    PROJECTM_TOUCH_TYPE_BLOB2,
+    PROJECTM_TOUCH_TYPE_BLOB3,
+    PROJECTM_TOUCH_TYPE_DERIVATIVE_LINE,
+    PROJECTM_TOUCH_TYPE_BLOB5,
+    PROJECTM_TOUCH_TYPE_LINE,
+    PROJECTM_TOUCH_TYPE_DOUBLE_LINE,
+};
+static constexpr int g_touchTypeCount = sizeof(g_touchTypes) / sizeof(g_touchTypes[0]);
+
+static const char* touchTypeName(projectm_touch_type t)
+{
+    switch (t) {
+    case PROJECTM_TOUCH_TYPE_RANDOM:          return "Random";
+    case PROJECTM_TOUCH_TYPE_CIRCLE:          return "Circle";
+    case PROJECTM_TOUCH_TYPE_RADIAL_BLOB:     return "Radial Blob";
+    case PROJECTM_TOUCH_TYPE_BLOB2:           return "Blob 2";
+    case PROJECTM_TOUCH_TYPE_BLOB3:           return "Blob 3";
+    case PROJECTM_TOUCH_TYPE_DERIVATIVE_LINE: return "Derivative Line";
+    case PROJECTM_TOUCH_TYPE_BLOB5:           return "Blob 5";
+    case PROJECTM_TOUCH_TYPE_LINE:            return "Line";
+    case PROJECTM_TOUCH_TYPE_DOUBLE_LINE:     return "Double Line";
+    default: return "???";
+    }
+}
 
 // ----- Debug -----
 
@@ -109,8 +143,9 @@ static void updateDebugTitle()
         preset = preset.substr(pos + 1);
     char title[512];
     snprintf(title, sizeof(title),
-             "Vibeus | %.0f FPS | %.2fx speed | %.0f%% audio | [%u/%u] %s",
+             "Vibeus | %.0f FPS | %.2fx speed | %.0f%% audio | Touch: %s P%d | [%u/%u] %s",
              g_currentFps, g_speedMultiplier, g_audioGain * 100.0f,
+             touchTypeName(g_touchTypes[g_touchTypeIndex]), g_touchPressure,
              g_presets.position() + 1, g_presets.count(), preset.c_str());
     SDL_SetWindowTitle(g_window, title);
 }
@@ -335,6 +370,12 @@ static void handleKeyDown(SDL_Keysym key)
     case SDLK_EQUALS: adjustAudioGain(+0.1f); break;
     case SDLK_0:      resetAudioGain(); break;
 
+    // Touch waveforms
+    case SDLK_c:
+        projectm_touch_destroy_all(g_pm);
+        fprintf(stderr, "[Vibeus] Cleared all touch waveforms\n");
+        break;
+
     case SDLK_f:
     case SDLK_F11:
         toggleFullscreen();
@@ -379,7 +420,11 @@ static void processEvents()
                 g_mouseDown = true;
                 float nx, ny;
                 screenToNormalized(event.button.x, event.button.y, nx, ny);
-                projectm_touch(g_pm, nx, ny, 1, PROJECTM_TOUCH_TYPE_RANDOM);
+                projectm_touch(g_pm, nx, ny, g_touchPressure, g_touchTypes[g_touchTypeIndex]);
+            } else if (event.button.button == SDL_BUTTON_RIGHT) {
+                // Cycle touch waveform type
+                g_touchTypeIndex = (g_touchTypeIndex + 1) % g_touchTypeCount;
+                fprintf(stderr, "[Vibeus] Touch type: %s\n", touchTypeName(g_touchTypes[g_touchTypeIndex]));
             }
             break;
 
@@ -387,16 +432,31 @@ static void processEvents()
             if (g_mouseDown) {
                 float nx, ny;
                 screenToNormalized(event.motion.x, event.motion.y, nx, ny);
-                projectm_touch_drag(g_pm, nx, ny, 1);
+                projectm_touch_drag(g_pm, nx, ny, g_touchPressure);
             }
             break;
 
         case SDL_MOUSEBUTTONUP:
             if (event.button.button == SDL_BUTTON_LEFT) {
                 g_mouseDown = false;
-                float nx, ny;
-                screenToNormalized(event.button.x, event.button.y, nx, ny);
-                projectm_touch_destroy(g_pm, nx, ny);
+                // Waveforms persist — use C key or right-click to manage
+            }
+            break;
+
+        case SDL_MOUSEWHEEL:
+            if (SDL_GetModState() & KMOD_SHIFT) {
+                // Shift+scroll = cycle touch type
+                if (event.wheel.y > 0)
+                    g_touchTypeIndex = (g_touchTypeIndex + 1) % g_touchTypeCount;
+                else if (event.wheel.y < 0)
+                    g_touchTypeIndex = (g_touchTypeIndex - 1 + g_touchTypeCount) % g_touchTypeCount;
+                fprintf(stderr, "[Vibeus] Touch type: %s\n", touchTypeName(g_touchTypes[g_touchTypeIndex]));
+            } else {
+                // Scroll = adjust touch pressure (0–2)
+                g_touchPressure += (event.wheel.y > 0) ? 1 : -1;
+                if (g_touchPressure < 0) g_touchPressure = 0;
+                if (g_touchPressure > 2) g_touchPressure = 2;
+                fprintf(stderr, "[Vibeus] Touch pressure: %d\n", g_touchPressure);
             }
             break;
 
@@ -472,7 +532,9 @@ int main(int argc, char* argv[])
     fprintf(stderr, "  F/F11=fullscreen  D=debug  Up/Down=beat sensitivity\n");
     fprintf(stderr, "  [/]=speed down/up  Backspace=reset speed\n");
     fprintf(stderr, "  -/==audio gain down/up  0=reset audio\n");
-    fprintf(stderr, "  Mouse click/drag=touch waveforms  Q/Esc=quit\n\n");
+    fprintf(stderr, "  Click=touch waveform  Drag=move  RightClick=cycle type\n");
+    fprintf(stderr, "  Scroll=pressure  Shift+Scroll=cycle type  C=clear waveforms\n");
+    fprintf(stderr, "  Q/Esc=quit\n\n");
 
     // 6. Main render loop
     Uint32 frameDelay = 1000 / TARGET_FPS;
