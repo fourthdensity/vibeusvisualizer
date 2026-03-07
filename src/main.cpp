@@ -1,28 +1,40 @@
 /**
  * Vibeus - A custom music visualizer frontend powered by projectM
  *
- * Barebones skeleton: SDL2 window + OpenGL + WASAPI loopback + projectM rendering
- *
  * Controls:
- *   N / Right     - Next preset
- *   P / Left      - Previous preset
- *   R             - Random preset (hard cut)
- *   H             - Go back in history
- *   S             - Toggle shuffle
- *   F / F11       - Toggle fullscreen
- *   Up/Down       - Adjust beat sensitivity
- *   D             - Toggle debug overlay (FPS + preset in title)
- *   [ / ]         - Slow down / speed up visualization
- *   Backspace     - Reset speed to 1.0x
- *   - / =         - Audio reactivity down / up
- *   0             - Reset audio reactivity to 1.0x
- *   Mouse click   - Create touch waveform (persists after release)
- *   Mouse drag    - Move touch waveform
- *   Right-click   - Cycle waveform type
- *   Scroll wheel  - Adjust touch pressure (0-2)
- *   Shift+Scroll  - Cycle waveform type
- *   C             - Clear all touch waveforms
- *   Escape / Q    - Quit
+ *   N / Right       - Next preset
+ *   P / Left        - Previous preset
+ *   R               - Random preset (hard cut)
+ *   H               - Go back in history
+ *   S               - Toggle shuffle
+ *   F / F11         - Toggle fullscreen
+ *   Up/Down         - Adjust beat sensitivity
+ *   D               - Toggle debug overlay
+ *   [ / ]           - Slow down / speed up visualization
+ *   Backspace       - Reset speed to 1.0x
+ *   - / =           - Audio reactivity down / up
+ *   0               - Reset audio reactivity to 1.0x
+ *   Mouse click     - Create touch waveform
+ *   Mouse drag      - Move touch waveform
+ *   Right-click     - Cycle waveform type
+ *   Scroll wheel    - Adjust touch pressure
+ *   Shift+Scroll    - Cycle waveform type
+ *   C               - Clear all touch waveforms
+ *   Tab             - Toggle flow mode (mouse controls speed + waveforms)
+ *   Escape          - Pause menu (during viz) / Back (in menus)
+ *   Q               - Quit
+ *
+ * Gamepad (if connected):
+ *   Left stick      - Speed control (X) + waveform position (Y)
+ *   Right stick     - Touch waveform creation & movement
+ *   A / Cross       - Next preset
+ *   B / Circle      - Previous preset
+ *   X / Square      - Random preset
+ *   Y / Triangle    - Toggle shuffle
+ *   Start           - Pause menu
+ *   LB / RB         - Audio gain down / up
+ *   LT / RT         - Speed down / up (analog)
+ *   D-Pad Up/Down   - Beat sensitivity
  */
 
 #ifdef _WIN32
@@ -37,6 +49,7 @@
 
 #include "audio_capture.h"
 #include "preset_manager.h"
+#include "menu_overlay.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -65,16 +78,25 @@ static bool          g_debug    = false;
 
 static AudioCapture  g_audio;
 static PresetManager g_presets;
+static MenuOverlay   g_menu;
+
+// App state machine: Splash → MainMenu → Visualizer (with pause overlay)
+enum class AppState { Splash, MainMenu, Visualizer };
+static AppState g_appState = AppState::Splash;
+
+// Pause state
+static bool          g_paused    = false;
+static double        g_pausedTime = 0.0;
+static int           g_pauseRenderCount = 0;
 
 // Debug stats
 static Uint32 g_frameCount  = 0;
 static Uint32 g_fpsTimer    = 0;
 static float  g_currentFps  = 0.0f;
 
-// Speed control - virtual clock fed to projectM
+// Speed control - always uses virtual clock for consistent pause/resume
 static double g_speedMultiplier = 1.0;    // 0.05x to 4.0x
 static double g_virtualTime     = 0.0;    // accumulated virtual seconds
-static bool   g_useVirtualTime  = false;  // false = real-time (default)
 static Uint32 g_lastFrameTicks  = 0;
 
 // Audio dampening - scales PCM amplitude before feeding to projectM
@@ -96,6 +118,13 @@ static constexpr projectm_touch_type g_touchTypes[] = {
     PROJECTM_TOUCH_TYPE_DOUBLE_LINE,
 };
 static constexpr int g_touchTypeCount = sizeof(g_touchTypes) / sizeof(g_touchTypes[0]);
+
+// Gamepad
+static SDL_GameController* g_gamepad = nullptr;
+static const int STICK_DEADZONE = 8000;  // out of 32768
+
+// Flow mode: mouse position controls speed + creates waveforms
+static bool  g_flowMode = false;
 
 static const char* touchTypeName(projectm_touch_type t)
 {
@@ -143,9 +172,11 @@ static void updateDebugTitle()
         preset = preset.substr(pos + 1);
     char title[512];
     snprintf(title, sizeof(title),
-             "Vibeus | %.0f FPS | %.2fx speed | %.0f%% audio | Touch: %s P%d | [%u/%u] %s",
+             "Vibeus | %.0f FPS | %.2fx speed | %.0f%% audio | Touch: %s P%d | %s%s[%u/%u] %s",
              g_currentFps, g_speedMultiplier, g_audioGain * 100.0f,
              touchTypeName(g_touchTypes[g_touchTypeIndex]), g_touchPressure,
+             g_flowMode ? "FLOW | " : "",
+             g_gamepad ? "GAMEPAD | " : "",
              g_presets.position() + 1, g_presets.count(), preset.c_str());
     SDL_SetWindowTitle(g_window, title);
 }
@@ -155,39 +186,45 @@ static void updateDebugTitle()
 static void adjustSpeed(double delta)
 {
     g_speedMultiplier += delta;
-    // Clamp to [0.05, 4.0]
     if (g_speedMultiplier < 0.05) g_speedMultiplier = 0.05;
     if (g_speedMultiplier > 4.0)  g_speedMultiplier = 4.0;
-
-    if (g_speedMultiplier == 1.0) {
-        // Back to real-time: disable virtual clock
-        g_useVirtualTime = false;
-        projectm_set_frame_time(g_pm, -1.0);
-    } else {
-        g_useVirtualTime = true;
-    }
-    fprintf(stderr, "[Vibeus] Speed: %.2fx%s\n",
-            g_speedMultiplier, g_useVirtualTime ? "" : " (real-time)");
+    fprintf(stderr, "[Vibeus] Speed: %.2fx\n", g_speedMultiplier);
 }
 
 static void resetSpeed()
 {
     g_speedMultiplier = 1.0;
-    g_useVirtualTime = false;
-    projectm_set_frame_time(g_pm, -1.0);
-    fprintf(stderr, "[Vibeus] Speed reset to 1.0x (real-time)\n");
+    fprintf(stderr, "[Vibeus] Speed reset to 1.0x\n");
 }
 
 static void updateVirtualTime(Uint32 nowTicks)
 {
-    if (!g_useVirtualTime) {
-        g_lastFrameTicks = nowTicks;
-        return;
-    }
     double realDelta = (nowTicks - g_lastFrameTicks) / 1000.0;
     g_lastFrameTicks = nowTicks;
+    // Cap delta to prevent jumps (e.g. after resume or stall)
+    if (realDelta > 0.1) realDelta = 0.1;
     g_virtualTime += realDelta * g_speedMultiplier;
     projectm_set_frame_time(g_pm, g_virtualTime);
+}
+
+// ----- Pause -----
+
+static void enterPause()
+{
+    g_paused = true;
+    g_pausedTime = g_virtualTime;
+    g_pauseRenderCount = 0; // reset so we render a few frozen frames
+    g_menu.showScreen(UIScreen::PauseMenu);
+    fprintf(stderr, "[Vibeus] Paused at virtual time %.3f\n", g_pausedTime);
+}
+
+static void resumeFromPause()
+{
+    g_paused = false;
+    g_menu.hideAll();
+    g_virtualTime = g_pausedTime;
+    g_lastFrameTicks = SDL_GetTicks();
+    fprintf(stderr, "[Vibeus] Resumed\n");
 }
 
 // ----- Audio Gain -----
@@ -214,6 +251,103 @@ static void screenToNormalized(int sx, int sy, float& nx, float& ny)
     SDL_GetWindowSize(g_window, &w, &h);
     nx = static_cast<float>(sx) / static_cast<float>(w);
     ny = static_cast<float>(sy) / static_cast<float>(h);
+}
+
+// ----- Gamepad -----
+
+static void tryOpenGamepad()
+{
+    if (g_gamepad) return; // already have one
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i)) {
+            g_gamepad = SDL_GameControllerOpen(i);
+            if (g_gamepad) {
+                fprintf(stderr, "[Vibeus] Gamepad connected: %s\n",
+                        SDL_GameControllerName(g_gamepad));
+                return;
+            }
+        }
+    }
+}
+
+static float stickAxis(SDL_GameControllerAxis axis)
+{
+    if (!g_gamepad) return 0.0f;
+    int raw = SDL_GameControllerGetAxis(g_gamepad, axis);
+    if (abs(raw) < STICK_DEADZONE) return 0.0f;
+    return static_cast<float>(raw) / 32768.0f;
+}
+
+static void processGamepad()
+{
+    if (!g_gamepad) return;
+    if (g_paused || g_appState != AppState::Visualizer) return;
+
+    // Left trigger = slow down, Right trigger = speed up (analog)
+    float lt = static_cast<float>(SDL_GameControllerGetAxis(g_gamepad, SDL_CONTROLLER_AXIS_TRIGGERLEFT)) / 32768.0f;
+    float rt = static_cast<float>(SDL_GameControllerGetAxis(g_gamepad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT)) / 32768.0f;
+    if (lt > 0.1f || rt > 0.1f) {
+        // Map triggers: LT slows (toward 0.1x), RT speeds (toward 4x)
+        double targetSpeed = 1.0 + (rt - lt) * 1.5;
+        // Smoothly interpolate toward target
+        g_speedMultiplier += (targetSpeed - g_speedMultiplier) * 0.08;
+        if (g_speedMultiplier < 0.05) g_speedMultiplier = 0.05;
+        if (g_speedMultiplier > 4.0)  g_speedMultiplier = 4.0;
+    }
+
+    // Right stick = touch waveform control
+    float rx = stickAxis(SDL_CONTROLLER_AXIS_RIGHTX);
+    float ry = stickAxis(SDL_CONTROLLER_AXIS_RIGHTY);
+    if (fabsf(rx) > 0.0f || fabsf(ry) > 0.0f) {
+        float nx = 0.5f + rx * 0.5f;  // map -1..1 to 0..1
+        float ny = 0.5f + ry * 0.5f;
+        float magnitude = sqrtf(rx * rx + ry * ry);
+        int pressure = (magnitude > 0.7f) ? 2 : (magnitude > 0.3f) ? 1 : 0;
+        projectm_touch(g_pm, nx, ny, pressure, g_touchTypes[g_touchTypeIndex]);
+    }
+
+    // Left stick X = fine speed adjustment
+    float lx = stickAxis(SDL_CONTROLLER_AXIS_LEFTX);
+    if (fabsf(lx) > 0.0f) {
+        g_speedMultiplier += lx * 0.02;
+        if (g_speedMultiplier < 0.05) g_speedMultiplier = 0.05;
+        if (g_speedMultiplier > 4.0)  g_speedMultiplier = 4.0;
+    }
+}
+
+// ----- Flow Mode -----
+
+static void processFlowMode()
+{
+    if (!g_flowMode || g_paused || g_appState != AppState::Visualizer) return;
+
+    int mx, my;
+    SDL_GetMouseState(&mx, &my);
+    int w, h;
+    SDL_GetWindowSize(g_window, &w, &h);
+
+    // Normalized mouse position: 0..1
+    float nx = static_cast<float>(mx) / static_cast<float>(w);
+    float ny = static_cast<float>(my) / static_cast<float>(h);
+
+    // Horizontal position maps to speed: left=0.2x, center=1.0x, right=3.0x
+    double targetSpeed = 0.2 + nx * 2.8;
+    g_speedMultiplier += (targetSpeed - g_speedMultiplier) * 0.05;
+    if (g_speedMultiplier < 0.05) g_speedMultiplier = 0.05;
+    if (g_speedMultiplier > 4.0)  g_speedMultiplier = 4.0;
+
+    // Vertical position creates subtle waveforms at mouse location
+    // Lower = more waveforms (every N frames)
+    int interval = static_cast<int>(15.0f - ny * 12.0f); // top=15 frames, bottom=3 frames
+    if (interval < 2) interval = 2;
+    static int flowFrameCount = 0;
+    flowFrameCount++;
+    if (flowFrameCount >= interval) {
+        flowFrameCount = 0;
+        int pressure = static_cast<int>(ny * 2.0f); // top=0, bottom=2
+        if (pressure > 2) pressure = 2;
+        projectm_touch(g_pm, nx, ny, pressure, g_touchTypes[g_touchTypeIndex]);
+    }
 }
 
 #ifdef _WIN32
@@ -248,7 +382,7 @@ static std::string findPresetsDir()
 
 static bool initSDL()
 {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "[Vibeus] SDL_Init failed: %s\n", SDL_GetError());
         return false;
     }
@@ -325,8 +459,10 @@ static void toggleFullscreen()
 
 static void handleKeyDown(SDL_Keysym key)
 {
+    if (g_debug)
+        fprintf(stderr, "[Vibeus] Key: %s (0x%x)\n", SDL_GetKeyName(key.sym), key.sym);
+
     switch (key.sym) {
-    case SDLK_ESCAPE:
     case SDLK_q:
         g_running = false;
         break;
@@ -376,6 +512,16 @@ static void handleKeyDown(SDL_Keysym key)
         fprintf(stderr, "[Vibeus] Cleared all touch waveforms\n");
         break;
 
+    // Flow mode toggle
+    case SDLK_TAB:
+        g_flowMode = !g_flowMode;
+        fprintf(stderr, "[Vibeus] Flow mode: %s\n", g_flowMode ? "ON" : "OFF");
+        if (!g_flowMode) {
+            // Reset speed when exiting flow mode
+            g_speedMultiplier = 1.0;
+        }
+        break;
+
     case SDLK_f:
     case SDLK_F11:
         toggleFullscreen();
@@ -406,11 +552,97 @@ static void processEvents()
 {
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
-        switch (event.type) {
-        case SDL_QUIT:
-            g_running = false;
-            break;
+        // Only forward events to ImGui when UI is visible
+        if (g_menu.isVisible())
+            g_menu.processEvent(event);
 
+        // Always handle window close
+        if (event.type == SDL_QUIT) {
+            g_running = false;
+            continue;
+        }
+
+        // Gamepad hotplug
+        if (event.type == SDL_CONTROLLERDEVICEADDED) {
+            tryOpenGamepad();
+            continue;
+        }
+        if (event.type == SDL_CONTROLLERDEVICEREMOVED) {
+            if (g_gamepad) {
+                SDL_GameControllerClose(g_gamepad);
+                g_gamepad = nullptr;
+                fprintf(stderr, "[Vibeus] Gamepad disconnected\n");
+            }
+            continue;
+        }
+
+        // --- State-specific input handling ---
+
+        // During splash/main menu, all input goes to the UI
+        if (g_appState == AppState::Splash || g_appState == AppState::MainMenu)
+            continue;
+
+        // In visualizer state:
+
+        // ESC toggles pause menu
+        if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
+            if (g_paused) resumeFromPause();
+            else enterPause();
+            continue;
+        }
+
+        // Gamepad Start = pause menu
+        if (event.type == SDL_CONTROLLERBUTTONDOWN &&
+            event.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
+            if (g_paused) resumeFromPause();
+            else enterPause();
+            continue;
+        }
+
+        // When paused/in browser, suppress normal visualizer input
+        if (g_paused) continue;
+
+        // Gamepad buttons (during active visualization)
+        if (event.type == SDL_CONTROLLERBUTTONDOWN) {
+            switch (event.cbutton.button) {
+            case SDL_CONTROLLER_BUTTON_A:
+                g_presets.next(false);
+                break;
+            case SDL_CONTROLLER_BUTTON_B:
+                g_presets.previous(false);
+                break;
+            case SDL_CONTROLLER_BUTTON_X:
+                g_presets.next(true); // hard cut
+                break;
+            case SDL_CONTROLLER_BUTTON_Y:
+                g_presets.toggleShuffle();
+                break;
+            case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
+                adjustAudioGain(-0.1f);
+                break;
+            case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:
+                adjustAudioGain(+0.1f);
+                break;
+            case SDL_CONTROLLER_BUTTON_DPAD_UP: {
+                float sens = projectm_get_beat_sensitivity(g_pm);
+                sens = (sens < 4.9f) ? sens + 0.2f : 5.0f;
+                projectm_set_beat_sensitivity(g_pm, sens);
+                fprintf(stderr, "[Vibeus] Beat sensitivity: %.1f\n", sens);
+                break;
+            }
+            case SDL_CONTROLLER_BUTTON_DPAD_DOWN: {
+                float sens = projectm_get_beat_sensitivity(g_pm);
+                sens = (sens > 0.2f) ? sens - 0.2f : 0.0f;
+                projectm_set_beat_sensitivity(g_pm, sens);
+                fprintf(stderr, "[Vibeus] Beat sensitivity: %.1f\n", sens);
+                break;
+            }
+            default: break;
+            }
+            continue;
+        }
+
+        switch (event.type) {
         case SDL_KEYDOWN:
             handleKeyDown(event.key.keysym);
             break;
@@ -475,6 +707,100 @@ static void processEvents()
     }
 }
 
+// ----- Handle Menu Actions -----
+
+static void handleMenuAction(MenuAction action)
+{
+    switch (action) {
+    case MenuAction::BackToMenu:
+        g_appState = AppState::MainMenu;
+        g_menu.showScreen(UIScreen::MainMenu);
+        break;
+
+    case MenuAction::StartVisualizer:
+        g_appState = AppState::Visualizer;
+        g_menu.hideAll();
+        g_paused = false;
+        g_lastFrameTicks = SDL_GetTicks();
+        fprintf(stderr, "[Vibeus] Starting visualizer\n");
+        break;
+
+    case MenuAction::Resume:
+        resumeFromPause();
+        g_menu.hideAll();
+        break;
+
+    case MenuAction::BrowsePresets:
+        g_menu.loadPresetList(g_presets.handle());
+        // Try to load favorites
+        {
+            auto exePath = fs::path(SDL_GetBasePath());
+            std::string favPath = (exePath / "favorites.txt").string();
+            g_menu.loadFavorites(favPath);
+        }
+        g_menu.showScreen(UIScreen::PresetBrowser);
+        break;
+
+    case MenuAction::PlayPreset: {
+        uint32_t idx = g_menu.selectedPresetIndex();
+        projectm_playlist_set_position(g_presets.handle(), idx, true);
+        fprintf(stderr, "[Vibeus] Playing preset #%u\n", idx);
+        // If we were in main menu, start the visualizer
+        if (g_appState == AppState::MainMenu) {
+            g_appState = AppState::Visualizer;
+            g_menu.hideAll();
+            g_paused = false;
+            g_lastFrameTicks = SDL_GetTicks();
+        }
+        // If paused, resume
+        else if (g_paused) {
+            resumeFromPause();
+            g_menu.hideAll();
+        }
+        break;
+    }
+
+    case MenuAction::BackToPause:
+        // Save favorites before leaving browser
+        {
+            auto exePath = fs::path(SDL_GetBasePath());
+            std::string favPath = (exePath / "favorites.txt").string();
+            g_menu.saveFavorites(favPath);
+        }
+        g_menu.showScreen(UIScreen::PauseMenu);
+        break;
+
+    case MenuAction::Settings:
+        fprintf(stderr, "[Vibeus] Settings not yet implemented\n");
+        break;
+
+    case MenuAction::Record:
+        fprintf(stderr, "[Vibeus] Recording not yet implemented\n");
+        break;
+
+    case MenuAction::ExitToDesktop:
+        // Save favorites on exit
+        {
+            auto exePath = fs::path(SDL_GetBasePath());
+            std::string favPath = (exePath / "favorites.txt").string();
+            g_menu.saveFavorites(favPath);
+        }
+        g_running = false;
+        break;
+
+    default:
+        break;
+    }
+
+    // Also save favorites when returning to main menu from browser
+    if (action == MenuAction::BackToMenu &&
+        g_menu.currentScreen() == UIScreen::MainMenu) {
+        auto exePath = fs::path(SDL_GetBasePath());
+        std::string favPath = (exePath / "favorites.txt").string();
+        g_menu.saveFavorites(favPath);
+    }
+}
+
 // ----- Main -----
 
 int main(int argc, char* argv[])
@@ -490,7 +816,7 @@ int main(int argc, char* argv[])
         attachConsole();
 #endif
 
-    fprintf(stderr, "=== Vibeus v0.1.0 ===\n");
+    fprintf(stderr, "=== Vibeus v0.2.0 ===\n");
     if (g_debug)
         fprintf(stderr, "[DEBUG MODE ENABLED]\n");
     fprintf(stderr, "\n");
@@ -499,7 +825,7 @@ int main(int argc, char* argv[])
     if (!initSDL()) return 1;
     fprintf(stderr, "[Vibeus] SDL2 + OpenGL 3.3 context ready\n");
 
-    // 2. Set up projectM logging (before create so we see init messages)
+    // 2. Set up projectM logging
     if (g_debug) {
         projectm_set_log_level(PROJECTM_LOG_LEVEL_DEBUG, false);
     } else {
@@ -534,9 +860,22 @@ int main(int argc, char* argv[])
     fprintf(stderr, "  -/==audio gain down/up  0=reset audio\n");
     fprintf(stderr, "  Click=touch waveform  Drag=move  RightClick=cycle type\n");
     fprintf(stderr, "  Scroll=pressure  Shift+Scroll=cycle type  C=clear waveforms\n");
-    fprintf(stderr, "  Q/Esc=quit\n\n");
+    fprintf(stderr, "  Tab=flow mode  Esc=pause menu  Q=quit\n");
+    fprintf(stderr, "  Gamepad: A=next B=prev X=random Y=shuffle Start=pause\n\n");
 
-    // 6. Main render loop
+    // 6. Initialize menu overlay
+    if (!g_menu.init(g_window, g_glCtx)) {
+        fprintf(stderr, "[Vibeus] WARNING: Menu overlay init failed\n");
+    }
+
+    // 7. Try to open gamepad
+    tryOpenGamepad();
+
+    // 8. Start with epilepsy splash screen
+    g_appState = AppState::Splash;
+    g_menu.showScreen(UIScreen::Splash);
+
+    // 9. Main render loop
     Uint32 frameDelay = 1000 / TARGET_FPS;
     g_fpsTimer = SDL_GetTicks();
     g_lastFrameTicks = g_fpsTimer;
@@ -547,14 +886,51 @@ int main(int argc, char* argv[])
         // Process input
         processEvents();
 
-        // Update virtual time for speed control
-        updateVirtualTime(SDL_GetTicks());
+        // State-specific rendering
+        switch (g_appState) {
+        case AppState::Splash:
+        case AppState::MainMenu:
+            // Render a single projectM frame as eye-candy background
+            if (g_appState == AppState::MainMenu || g_appState == AppState::Splash) {
+                // Slowly advance time for subtle background animation
+                static double menuBgTime = 0.0;
+                menuBgTime += 0.016 * 0.3; // 30% speed
+                projectm_set_frame_time(g_pm, menuBgTime);
+                g_audio.feedAudio(g_pm, 0.3f); // low audio reactivity for bg
+                projectm_opengl_render_frame(g_pm);
+            }
+            break;
 
-        // Capture audio and feed to projectM (with gain applied)
-        g_audio.feedAudio(g_pm, g_audioGain);
+        case AppState::Visualizer:
+            if (!g_paused) {
+                // Process analog gamepad input
+                processGamepad();
+                // Process flow mode (mouse-driven manipulation)
+                processFlowMode();
+                // Update virtual time for speed control
+                updateVirtualTime(SDL_GetTicks());
+                // Capture audio and feed to projectM (with gain applied)
+                g_audio.feedAudio(g_pm, g_audioGain);
+                // Render visualization frame
+                projectm_opengl_render_frame(g_pm);
+            } else {
+                // While paused, render a few frozen frames then stop
+                if (g_pauseRenderCount < 3) {
+                    projectm_set_frame_time(g_pm, g_pausedTime);
+                    projectm_opengl_render_frame(g_pm);
+                    g_pauseRenderCount++;
+                }
+            }
+            break;
+        }
 
-        // Render frame
-        projectm_opengl_render_frame(g_pm);
+        // Render UI overlay if visible (draws on top of everything)
+        if (g_menu.isVisible()) {
+            MenuAction action = g_menu.render();
+            if (action != MenuAction::None)
+                handleMenuAction(action);
+        }
+
         SDL_GL_SwapWindow(g_window);
 
         // FPS tracking
@@ -564,7 +940,8 @@ int main(int argc, char* argv[])
             g_currentFps = g_frameCount * 1000.0f / (now - g_fpsTimer);
             g_frameCount = 0;
             g_fpsTimer = now;
-            updateDebugTitle();
+            if (g_appState == AppState::Visualizer)
+                updateDebugTitle();
         }
 
         // Frame rate limiter
@@ -574,10 +951,14 @@ int main(int argc, char* argv[])
         }
     }
 
-    // 7. Cleanup
+    // 10. Cleanup
     fprintf(stderr, "\n[Vibeus] Shutting down...\n");
+    g_menu.shutdown();
     g_audio.shutdown();
-    // PresetManager and projectM cleaned up by destructors / explicit destroy
+    if (g_gamepad) {
+        SDL_GameControllerClose(g_gamepad);
+        g_gamepad = nullptr;
+    }
     projectm_destroy(g_pm);
     g_pm = nullptr;
 

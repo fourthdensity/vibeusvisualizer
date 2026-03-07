@@ -12,6 +12,9 @@ find_package(SDL2 CONFIG REQUIRED)
 # OpenGL
 find_package(OpenGL REQUIRED)
 
+# Dear ImGui (via vcpkg - core + opengl3 backend; SDL2 backend vendored in src/)
+find_package(imgui CONFIG REQUIRED)
+
 # projectM - point to the built library
 set(PROJECTM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../projectchilltitties" CACHE PATH "Path to projectM source root")
 set(PROJECTM_BUILD "${PROJECTM_ROOT}/build" CACHE PATH "Path to projectM build directory")
@@ -61,11 +64,15 @@ set(SOURCES
     src/main.cpp
     src/audio_capture.cpp
     src/preset_manager.cpp
+    src/menu_overlay.cpp
+    src/imgui_impl_sdl2.cpp
 )
 
 set(HEADERS
     src/audio_capture.h
     src/preset_manager.h
+    src/menu_overlay.h
+    src/imgui_impl_sdl2.h
 )
 
 # --- Executable ---
@@ -83,6 +90,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     SDL2::SDL2
     SDL2::SDL2main
     OpenGL::GL
+    imgui::imgui
 )
 
 # Windows-specific: WASAPI audio loopback
