@@ -1,0 +1,39 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+CMakeSettings.json
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Compiled binaries (never commit these)
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.ilk
+*.exp
+
+# vcpkg local installs (use vcpkg.json manifest instead)
+vcpkg_installed/
+
+# Preset files (large, from external repo - don't bundle)
+presets/
+
+# Secrets / keys (if you ever add config files)
+*.env
+*.key
+*.pem
+secrets.*
