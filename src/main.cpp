@@ -50,6 +50,9 @@
 #include "audio_capture.h"
 #include "preset_manager.h"
 #include "menu_overlay.h"
+#include "config.h"
+
+#include <imgui.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -79,6 +82,10 @@ static bool          g_debug    = false;
 static AudioCapture  g_audio;
 static PresetManager g_presets;
 static MenuOverlay   g_menu;
+
+// Configuration (persisted to JSON)
+static VibeusConfig  g_config;
+static std::string   g_configPath;
 
 // App state machine: Splash → MainMenu → Visualizer (with pause overlay)
 enum class AppState { Splash, MainMenu, Visualizer };
@@ -707,6 +714,41 @@ static void processEvents()
     }
 }
 
+// ----- Apply Configuration -----
+
+static void applyConfig(const VibeusConfig& cfg)
+{
+    // Audio
+    g_audioGain = cfg.audioGain;
+    if (g_pm) {
+        projectm_set_beat_sensitivity(g_pm, cfg.beatSensitivity);
+
+        // Presets
+        projectm_set_preset_duration(g_pm, cfg.presetDuration);
+        projectm_set_soft_cut_duration(g_pm, cfg.transitionTime);
+        projectm_set_hard_cut_enabled(g_pm, cfg.autoAdvance);
+    }
+
+    // Shuffle
+    if (cfg.shuffle != g_presets.isShuffled())
+        g_presets.toggleShuffle();
+
+    // Display
+    if (cfg.fullscreen != g_fullscreen)
+        toggleFullscreen();
+
+    g_debug = cfg.showFps;
+    if (!g_debug)
+        SDL_SetWindowTitle(g_window, "Vibeus");
+
+    // Motion
+    g_speedMultiplier = cfg.speedMultiplier;
+    g_flowMode = cfg.flowMode;
+
+    // UI scale (base 1.35 * user factor)
+    ImGui::GetIO().FontGlobalScale = 1.35f * cfg.fontScale;
+}
+
 // ----- Handle Menu Actions -----
 
 static void handleMenuAction(MenuAction action)
@@ -771,7 +813,12 @@ static void handleMenuAction(MenuAction action)
         break;
 
     case MenuAction::Settings:
-        fprintf(stderr, "[Vibeus] Settings not yet implemented\n");
+        // Remember where we came from so Back returns correctly
+        if (g_appState == AppState::Visualizer && g_paused)
+            g_menu.setSettingsReturnScreen(UIScreen::PauseMenu);
+        else
+            g_menu.setSettingsReturnScreen(UIScreen::MainMenu);
+        g_menu.showScreen(UIScreen::Settings);
         break;
 
     case MenuAction::Record:
@@ -785,7 +832,25 @@ static void handleMenuAction(MenuAction action)
             std::string favPath = (exePath / "favorites.txt").string();
             g_menu.saveFavorites(favPath);
         }
+        saveConfig(g_config, g_configPath);
         g_running = false;
+        break;
+
+    case MenuAction::ApplySettings:
+        applyConfig(g_config);
+        saveConfig(g_config, g_configPath);
+        break;
+
+    case MenuAction::BackFromSettings:
+        applyConfig(g_config);
+        saveConfig(g_config, g_configPath);
+        // Return to the screen that opened settings
+        {
+            UIScreen returnTo = g_menu.currentScreen(); // still Settings
+            (void)returnTo;
+        }
+        // The overlay tracks m_settingsReturnTo internally
+        g_menu.showScreen(g_menu.settingsReturnScreen());
         break;
 
     default:
@@ -868,14 +933,32 @@ int main(int argc, char* argv[])
         fprintf(stderr, "[Vibeus] WARNING: Menu overlay init failed\n");
     }
 
-    // 7. Try to open gamepad
+    // 7. Load user configuration
+    g_configPath = (fs::path(SDL_GetBasePath()) / "vibeus_config.json").string();
+    g_config = loadConfig(g_configPath);
+    g_menu.setConfigPtr(&g_config);
+
+    // Apply saved config to all systems (except fullscreen on startup — handled by config value)
+    {
+        // Sync config → globals without triggering fullscreen toggle at launch
+        bool savedFullscreen = g_config.fullscreen;
+        g_config.fullscreen = g_fullscreen; // pretend it matches current state
+        applyConfig(g_config);
+        g_config.fullscreen = savedFullscreen; // restore for future use
+        // If user wants fullscreen on startup, toggle it now
+        if (savedFullscreen && !g_fullscreen)
+            toggleFullscreen();
+    }
+    fprintf(stderr, "[Vibeus] Config loaded from %s\n", g_configPath.c_str());
+
+    // 8. Try to open gamepad
     tryOpenGamepad();
 
-    // 8. Start with epilepsy splash screen
+    // 9. Start with epilepsy splash screen
     g_appState = AppState::Splash;
     g_menu.showScreen(UIScreen::Splash);
 
-    // 9. Main render loop
+    // 10. Main render loop
     Uint32 frameDelay = 1000 / TARGET_FPS;
     g_fpsTimer = SDL_GetTicks();
     g_lastFrameTicks = g_fpsTimer;
@@ -951,7 +1034,7 @@ int main(int argc, char* argv[])
         }
     }
 
-    // 10. Cleanup
+    // 11. Cleanup
     fprintf(stderr, "\n[Vibeus] Shutting down...\n");
     g_menu.shutdown();
     g_audio.shutdown();

@@ -3,6 +3,8 @@
 #include <SDL.h>
 #include <projectM-4/playlist.h>
 
+#include "config.h"
+
 #include <string>
 #include <vector>
 #include <set>
@@ -15,6 +17,7 @@ enum class UIScreen {
     MainMenu,       // Main menu (Start, Browse, Settings, Exit)
     PauseMenu,      // Pause overlay during visualization
     PresetBrowser,  // Browse / search / favorite presets
+    Settings,       // Settings panel (Basic / Advanced tabs)
 };
 
 // Actions the UI can request from the app
@@ -30,6 +33,8 @@ enum class MenuAction {
     PlayPreset,       // selected preset index in selectedPresetIndex()
     BackToMenu,
     BackToPause,
+    ApplySettings,
+    BackFromSettings,
 };
 
 class MenuOverlay {
@@ -64,6 +69,11 @@ public:
     void saveFavorites(const std::string& path);
     void loadFavorites(const std::string& path);
 
+    // Settings: point at the app's config struct (non-owning)
+    void setConfigPtr(VibeusConfig* cfg) { m_config = cfg; }
+    void setSettingsReturnScreen(UIScreen screen) { m_settingsReturnTo = screen; }
+    UIScreen settingsReturnScreen() const { return m_settingsReturnTo; }
+
 private:
     UIScreen m_screen = UIScreen::None;
     SDL_Window* m_window = nullptr;
@@ -82,6 +92,11 @@ private:
     bool m_showFavoritesOnly = false;
     UIScreen m_browserReturnTo = UIScreen::MainMenu; // where to go back to
 
+    // Settings state
+    VibeusConfig* m_config = nullptr;
+    int m_settingsTab = 0;                           // 0=Basic, 1=Advanced
+    UIScreen m_settingsReturnTo = UIScreen::MainMenu;
+
     void applyStyle();
 
     // Screen renderers
@@ -89,6 +104,7 @@ private:
     MenuAction renderMainMenu();
     MenuAction renderPauseMenu();
     MenuAction renderPresetBrowser();
+    MenuAction renderSettings();
 
     // Shared helpers
     void beginFrame();

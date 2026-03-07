@@ -72,6 +72,7 @@ MenuAction MenuOverlay::render()
     case UIScreen::MainMenu:      action = renderMainMenu(); break;
     case UIScreen::PauseMenu:     action = renderPauseMenu(); break;
     case UIScreen::PresetBrowser: action = renderPresetBrowser(); break;
+    case UIScreen::Settings:      action = renderSettings(); break;
     default: break;
     }
 
@@ -547,6 +548,274 @@ MenuAction MenuOverlay::renderPresetBrowser()
 
     ImGui::EndChild();
     ImGui::End();
+
+    return action;
+}
+
+// ─── Settings ───────────────────────────────────────────────────────
+
+MenuAction MenuOverlay::renderSettings()
+{
+    drawBackdrop(0.92f);
+
+    ImGuiIO& io = ImGui::GetIO();
+    ImVec2 ds = io.DisplaySize;
+
+    float margin = 60.0f;
+    ImVec2 panelSize(std::min(ds.x - margin * 2, 620.0f), ds.y - margin * 2);
+    if (panelSize.y < 400) panelSize.y = 400;
+    ImVec2 panelPos((ds.x - panelSize.x) * 0.5f, (ds.y - panelSize.y) * 0.5f);
+
+    ImGui::SetNextWindowPos(panelPos);
+    ImGui::SetNextWindowSize(panelSize);
+    ImGui::Begin("##settings", nullptr,
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoResize);
+
+    float pad = ImGui::GetStyle().WindowPadding.x;
+    float contentW = panelSize.x - pad * 2.0f;
+
+    MenuAction action = MenuAction::None;
+    bool changed = false;
+
+    // ── Title row with back button ──
+    if (ImGui::Button("< Back", ImVec2(80, 36))) {
+        action = MenuAction::BackFromSettings;
+    }
+    ImGui::SameLine();
+    {
+        const char* t = "S E T T I N G S";
+        ImVec2 ts = ImGui::CalcTextSize(t);
+        ImGui::SetCursorPosX((panelSize.x - ts.x) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.75f, 1.0f, 0.95f));
+        ImGui::TextUnformatted(t);
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (!m_config) {
+        ImGui::TextDisabled("No configuration loaded.");
+        ImGui::End();
+        return action;
+    }
+
+    // ── Tab bar ──
+    if (ImGui::BeginTabBar("##settingsTabs")) {
+
+        // ═══════ BASIC TAB ═══════
+        if (ImGui::BeginTabItem("  Basic  ")) {
+            m_settingsTab = 0;
+
+            ImGui::BeginChild("##basicScroll", ImVec2(0, 0), false);
+
+            // ── Mood Preset ──
+            ImGui::SeparatorText("Mood Preset");
+            {
+                const char* moods[] = { "Chill", "Party", "Focus", "Psychedelic", "Custom" };
+                int moodIdx = static_cast<int>(m_config->mood);
+                ImGui::SetNextItemWidth(contentW * 0.5f);
+                if (ImGui::Combo("##mood", &moodIdx, moods, 5)) {
+                    m_config->mood = static_cast<MoodPreset>(moodIdx);
+                    if (m_config->mood != MoodPreset::Custom) {
+                        applyMoodPreset(*m_config, m_config->mood);
+                    }
+                    changed = true;
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Mood presets adjust audio, speed, transitions\nand sensitivity as a bundle. Choose Custom\nto tune everything manually.");
+                }
+            }
+
+            // ── Vibe Lock ──
+            if (m_config->vibeLock) {
+                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f, 0.45f, 0.25f, 0.80f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.20f, 0.55f, 0.30f, 0.90f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.25f, 0.65f, 0.35f, 1.00f));
+                if (ImGui::Button("Vibe Locked", ImVec2(contentW, 40))) {
+                    m_config->vibeLock = false;
+                    changed = true;
+                }
+                ImGui::PopStyleColor(3);
+            } else {
+                if (ImGui::Button("Vibe Lock", ImVec2(contentW, 40))) {
+                    m_config->vibeLock = true;
+                    changed = true;
+                }
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(?)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Vibe Lock freezes preset switching.\nThe current preset plays forever.");
+            }
+
+            ImGui::Spacing();
+
+            // ── Audio ──
+            ImGui::SeparatorText("Audio");
+            {
+                int gainPct = static_cast<int>(m_config->audioGain * 100.0f);
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::SliderInt("Audio Gain", &gainPct, 0, 300, "%d%%")) {
+                    m_config->audioGain = gainPct / 100.0f;
+                    m_config->mood = MoodPreset::Custom;
+                    changed = true;
+                }
+
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::SliderFloat("Beat Sensitivity", &m_config->beatSensitivity, 0.0f, 5.0f, "%.1f")) {
+                    m_config->mood = MoodPreset::Custom;
+                    changed = true;
+                }
+            }
+
+            ImGui::Spacing();
+
+            // ── Presets ──
+            ImGui::SeparatorText("Presets");
+            {
+                if (ImGui::Checkbox("Auto-Advance", &m_config->autoAdvance))
+                    changed = true;
+
+                if (m_config->autoAdvance) {
+                    ImGui::SetNextItemWidth(contentW * 0.65f);
+                    if (ImGui::SliderFloat("Preset Duration", &m_config->presetDuration, 10.0f, 120.0f, "%.0f sec")) {
+                        m_config->mood = MoodPreset::Custom;
+                        changed = true;
+                    }
+                }
+
+                if (ImGui::Checkbox("Shuffle", &m_config->shuffle))
+                    changed = true;
+
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::SliderFloat("Transition Time", &m_config->transitionTime, 0.0f, 10.0f, "%.1f sec")) {
+                    m_config->mood = MoodPreset::Custom;
+                    changed = true;
+                }
+            }
+
+            ImGui::Spacing();
+
+            // ── Display ──
+            ImGui::SeparatorText("Display");
+            {
+                if (ImGui::Checkbox("Fullscreen", &m_config->fullscreen))
+                    changed = true;
+
+                if (ImGui::Checkbox("Show FPS", &m_config->showFps))
+                    changed = true;
+
+                const char* perfModes[] = { "Battery Saver", "Balanced", "Quality" };
+                int pmIdx = static_cast<int>(m_config->perfMode);
+                ImGui::SetNextItemWidth(contentW * 0.5f);
+                if (ImGui::Combo("Performance", &pmIdx, perfModes, 3)) {
+                    m_config->perfMode = static_cast<PerfMode>(pmIdx);
+                    changed = true;
+                }
+            }
+
+            ImGui::Spacing();
+
+            // ── Safety / Accessibility ──
+            ImGui::SeparatorText("Accessibility");
+            {
+                if (ImGui::Checkbox("Flash Limiter", &m_config->flashLimiter))
+                    changed = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Limits rapid brightness changes\nto reduce photosensitivity risk.");
+
+                if (ImGui::Checkbox("Reduced Motion", &m_config->reducedMotion))
+                    changed = true;
+
+                int fontPct = static_cast<int>(m_config->fontScale * 100.0f);
+                ImGui::SetNextItemWidth(contentW * 0.5f);
+                if (ImGui::SliderInt("Font Scale", &fontPct, 75, 200, "%d%%")) {
+                    m_config->fontScale = fontPct / 100.0f;
+                    changed = true;
+                }
+            }
+
+            ImGui::Spacing();
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // ── Reset Defaults ──
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.45f, 0.08f, 0.08f, 0.50f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.65f, 0.12f, 0.12f, 0.70f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.75f, 0.18f, 0.18f, 0.90f));
+            if (ImGui::Button("Reset to Defaults", ImVec2(contentW, 38))) {
+                *m_config = VibeusConfig{};
+                changed = true;
+            }
+            ImGui::PopStyleColor(3);
+
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+
+        // ═══════ ADVANCED TAB ═══════
+        if (ImGui::BeginTabItem("  Advanced  ")) {
+            m_settingsTab = 1;
+
+            ImGui::BeginChild("##advScroll", ImVec2(0, 0), false);
+
+            // ── Motion ──
+            ImGui::SeparatorText("Motion");
+            {
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::SliderFloat("Animation Speed", &m_config->speedMultiplier, 0.05f, 4.0f, "%.2fx")) {
+                    m_config->mood = MoodPreset::Custom;
+                    changed = true;
+                }
+
+                int uiPct = static_cast<int>(m_config->uiScale * 100.0f);
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::SliderInt("UI Scale", &uiPct, 75, 200, "%d%%")) {
+                    m_config->uiScale = uiPct / 100.0f;
+                    changed = true;
+                }
+            }
+
+            ImGui::Spacing();
+
+            // ── Input ──
+            ImGui::SeparatorText("Input");
+            {
+                if (ImGui::Checkbox("Flow Mode", &m_config->flowMode))
+                    changed = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Mouse position controls animation speed\nand generates touch waveforms.");
+
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::SliderInt("Gamepad Deadzone", &m_config->gamepadDeadzone, 2000, 16000))
+                    changed = true;
+            }
+
+            ImGui::Spacing();
+            ImGui::Spacing();
+
+            ImGui::TextDisabled("More advanced settings coming in v0.4.0:");
+            ImGui::TextDisabled("  Visual Tuning, Audio Processing, Resolution Scaling,");
+            ImGui::TextDisabled("  Session Analytics, Per-Preset Overrides, Profiles.");
+
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabBar();
+    }
+
+    ImGui::End();
+
+    // If anything changed and we haven't already requested a back action
+    if (changed && action == MenuAction::None)
+        action = MenuAction::ApplySettings;
 
     return action;
 }

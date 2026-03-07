@@ -32,8 +32,20 @@ vcpkg_installed/
 # Preset files (large, from external repo - don't bundle)
 presets/
 
-# Secrets / keys (if you ever add config files)
+# Secrets / keys
 *.env
 *.key
 *.pem
 secrets.*
+
+# ── Vibeus proprietary / internal strategy ──
+# These files contain competitive research, pricing strategy,
+# product roadmap, and UX design documents. Keep local only.
+ROADMAP.md
+docs/SETTINGS_DESIGN.md
+docs/PERFORMANCE_GUIDE.md
+docs/internal/
+
+# Runtime config (user-generated, not for repo)
+vibeus_config.json
+favorites.txt
