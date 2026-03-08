@@ -59,6 +59,7 @@
 #include <string>
 #include <cstring>
 #include <filesystem>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -132,6 +133,122 @@ static const int STICK_DEADZONE = 8000;  // out of 32768
 
 // Flow mode: mouse position controls speed + creates waveforms
 static bool  g_flowMode = false;
+
+// ----- Cursor Ripple Physics -----
+// On click, spawn an expanding ring of touch points that radiate outward.
+// On drag, velocity-based perpendicular spread creates trail effects.
+
+struct Ripple {
+    float cx, cy;           // center (normalized 0..1)
+    Uint32 startMs;         // spawn time
+    float durationSec;      // total lifetime
+    int   ringCount;        // how many rings to spawn
+    int   pointsPerRing;    // touch points per ring
+    float maxRadius;        // max spread in normalized coords
+    projectm_touch_type type;
+};
+
+static std::vector<Ripple> g_ripples;
+
+// Previous mouse position for velocity calculation
+static int    g_prevMouseX = 0, g_prevMouseY = 0;
+static Uint32 g_prevMouseMs = 0;
+
+static void spawnRipple(float nx, float ny, float intensity = 1.0f)
+{
+    Ripple r;
+    r.cx         = nx;
+    r.cy         = ny;
+    r.startMs    = SDL_GetTicks();
+    r.durationSec = 0.5f * intensity;
+    r.ringCount   = static_cast<int>(4 * intensity);
+    if (r.ringCount < 2) r.ringCount = 2;
+    r.pointsPerRing = 8;
+    r.maxRadius   = 0.12f * intensity;
+    r.type        = g_touchTypes[g_touchTypeIndex];
+    g_ripples.push_back(r);
+}
+
+static void processRipples()
+{
+    if (g_ripples.empty()) return;
+    Uint32 now = SDL_GetTicks();
+
+    for (auto it = g_ripples.begin(); it != g_ripples.end(); ) {
+        float elapsed = (now - it->startMs) / 1000.0f;
+        if (elapsed >= it->durationSec) {
+            it = g_ripples.erase(it);
+            continue;
+        }
+
+        float progress = elapsed / it->durationSec; // 0..1
+        int currentRing = static_cast<int>(progress * it->ringCount);
+
+        // Spawn new ring points at current expansion radius
+        static int lastRing[64] = {}; // track last spawned ring per ripple
+        size_t idx = static_cast<size_t>(it - g_ripples.begin());
+        if (idx < 64 && currentRing > lastRing[idx]) {
+            lastRing[idx] = currentRing;
+
+            float radius = it->maxRadius * progress;
+            int pressure = (progress < 0.3f) ? 2 : (progress < 0.7f) ? 1 : 0;
+
+            for (int i = 0; i < it->pointsPerRing; i++) {
+                float angle = (2.0f * 3.14159265f * i) / it->pointsPerRing;
+                float px = it->cx + cosf(angle) * radius;
+                float py = it->cy + sinf(angle) * radius;
+                // Clamp to screen
+                if (px >= 0.0f && px <= 1.0f && py >= 0.0f && py <= 1.0f)
+                    projectm_touch(g_pm, px, py, pressure, it->type);
+            }
+        }
+        ++it;
+    }
+}
+
+static void processVelocityTrail(int mx, int my)
+{
+    Uint32 now = SDL_GetTicks();
+    float dt = (now - g_prevMouseMs) / 1000.0f;
+    if (dt < 0.001f) dt = 0.001f;
+
+    float dx = static_cast<float>(mx - g_prevMouseX);
+    float dy = static_cast<float>(my - g_prevMouseY);
+    float speed = sqrtf(dx * dx + dy * dy) / dt; // pixels/sec
+
+    g_prevMouseX = mx;
+    g_prevMouseY = my;
+    g_prevMouseMs = now;
+
+    if (speed < 50.0f) return; // below threshold — no trail
+
+    // Normalize velocity direction
+    float len = sqrtf(dx * dx + dy * dy);
+    if (len < 1.0f) return;
+    float ndx = dx / len, ndy = dy / len;
+
+    // Perpendicular direction for spread
+    float px = -ndy, py = ndx;
+
+    int w, h;
+    SDL_GetWindowSize(g_window, &w, &h);
+    float cnx = static_cast<float>(mx) / w;
+    float cny = static_cast<float>(my) / h;
+
+    // Spread proportional to speed (capped)
+    float spread = fminf(speed / 2000.0f, 0.08f);
+    int trailPoints = (speed > 400.0f) ? 4 : 2;
+    int pressure = (speed > 800.0f) ? 2 : 1;
+
+    for (int i = -trailPoints; i <= trailPoints; i++) {
+        if (i == 0) continue; // center handled by normal drag
+        float offset = spread * (static_cast<float>(i) / trailPoints);
+        float tx = cnx + px * offset;
+        float ty = cny + py * offset;
+        if (tx >= 0.0f && tx <= 1.0f && ty >= 0.0f && ty <= 1.0f)
+            projectm_touch(g_pm, tx, ty, pressure, g_touchTypes[g_touchTypeIndex]);
+    }
+}
 
 static const char* touchTypeName(projectm_touch_type t)
 {
@@ -445,8 +562,16 @@ static bool initProjectM()
 
     // Set texture search paths (for preset textures)
     std::string presetsDir = findPresetsDir();
-    const char* texPaths[] = { presetsDir.c_str() };
-    projectm_set_texture_search_paths(g_pm, texPaths, 1);
+    auto exeDir = fs::path(SDL_GetBasePath());
+    std::string texturesDir = (exeDir / "textures").string();
+
+    // Search both a dedicated textures folder and the presets folder
+    std::vector<const char*> texPaths;
+    if (fs::exists(texturesDir) && fs::is_directory(texturesDir))
+        texPaths.push_back(texturesDir.c_str());
+    texPaths.push_back(presetsDir.c_str());
+    projectm_set_texture_search_paths(g_pm, texPaths.data(),
+                                      static_cast<size_t>(texPaths.size()));
 
     return true;
 }
@@ -494,6 +619,7 @@ static void handleKeyDown(SDL_Keysym key)
 
     case SDLK_s:
         g_presets.toggleShuffle();
+        g_menu.showToast(g_presets.isShuffled() ? "Shuffle ON" : "Shuffle OFF");
         break;
 
     case SDLK_d:
@@ -501,6 +627,7 @@ static void handleKeyDown(SDL_Keysym key)
         if (!g_debug)
             SDL_SetWindowTitle(g_window, "Vibeus");
         fprintf(stderr, "[Vibeus] Debug display: %s\n", g_debug ? "ON" : "OFF");
+        g_menu.showToast(g_debug ? "Debug ON" : "Debug OFF");
         break;
 
     // Speed control
@@ -523,6 +650,7 @@ static void handleKeyDown(SDL_Keysym key)
     case SDLK_TAB:
         g_flowMode = !g_flowMode;
         fprintf(stderr, "[Vibeus] Flow mode: %s\n", g_flowMode ? "ON" : "OFF");
+        g_menu.showToast(g_flowMode ? "Flow Mode ON" : "Flow Mode OFF");
         if (!g_flowMode) {
             // Reset speed when exiting flow mode
             g_speedMultiplier = 1.0;
@@ -532,6 +660,7 @@ static void handleKeyDown(SDL_Keysym key)
     case SDLK_f:
     case SDLK_F11:
         toggleFullscreen();
+        g_menu.showToast(g_fullscreen ? "Fullscreen" : "Windowed");
         break;
 
     case SDLK_UP: {
@@ -660,6 +789,12 @@ static void processEvents()
                 float nx, ny;
                 screenToNormalized(event.button.x, event.button.y, nx, ny);
                 projectm_touch(g_pm, nx, ny, g_touchPressure, g_touchTypes[g_touchTypeIndex]);
+                // Spawn expanding ripple ring from click point
+                spawnRipple(nx, ny);
+                // Init velocity tracking
+                g_prevMouseX  = event.button.x;
+                g_prevMouseY  = event.button.y;
+                g_prevMouseMs = SDL_GetTicks();
             } else if (event.button.button == SDL_BUTTON_RIGHT) {
                 // Cycle touch waveform type
                 g_touchTypeIndex = (g_touchTypeIndex + 1) % g_touchTypeCount;
@@ -672,6 +807,8 @@ static void processEvents()
                 float nx, ny;
                 screenToNormalized(event.motion.x, event.motion.y, nx, ny);
                 projectm_touch_drag(g_pm, nx, ny, g_touchPressure);
+                // Velocity-based perpendicular trail spread
+                processVelocityTrail(event.motion.x, event.motion.y);
             }
             break;
 
@@ -726,7 +863,9 @@ static void applyConfig(const VibeusConfig& cfg)
         // Presets
         projectm_set_preset_duration(g_pm, cfg.presetDuration);
         projectm_set_soft_cut_duration(g_pm, cfg.transitionTime);
-        projectm_set_hard_cut_enabled(g_pm, cfg.autoAdvance);
+        projectm_set_hard_cut_enabled(g_pm, cfg.autoAdvance && cfg.hardCutEnabled);
+        projectm_set_hard_cut_sensitivity(g_pm, cfg.hardCutSensitivity);
+        projectm_set_hard_cut_duration(g_pm, cfg.hardCutDuration);
     }
 
     // Shuffle
@@ -837,20 +976,23 @@ static void handleMenuAction(MenuAction action)
         break;
 
     case MenuAction::ApplySettings:
+        // Apply in real-time (no disk save — that happens on Back)
         applyConfig(g_config);
-        saveConfig(g_config, g_configPath);
+        g_menu.showToast("Settings applied");
         break;
 
     case MenuAction::BackFromSettings:
         applyConfig(g_config);
         saveConfig(g_config, g_configPath);
+        g_menu.showToast("Settings saved");
         // Return to the screen that opened settings
         {
-            UIScreen returnTo = g_menu.currentScreen(); // still Settings
-            (void)returnTo;
+            UIScreen returnTo = g_menu.settingsReturnScreen();
+            g_menu.showScreen(returnTo);
+            // If returning to pause menu, re-render frozen frames for backdrop
+            if (returnTo == UIScreen::PauseMenu)
+                g_pauseRenderCount = 0;
         }
-        // The overlay tracks m_settingsReturnTo internally
-        g_menu.showScreen(g_menu.settingsReturnScreen());
         break;
 
     default:
@@ -984,12 +1126,17 @@ int main(int argc, char* argv[])
             }
             break;
 
-        case AppState::Visualizer:
-            if (!g_paused) {
+        case AppState::Visualizer: {
+            // Settings overlay keeps the visualizer running live
+            bool settingsLive = g_paused &&
+                                g_menu.currentScreen() == UIScreen::Settings;
+            if (!g_paused || settingsLive) {
                 // Process analog gamepad input
                 processGamepad();
                 // Process flow mode (mouse-driven manipulation)
                 processFlowMode();
+                // Process expanding ripple rings
+                processRipples();
                 // Update virtual time for speed control
                 updateVirtualTime(SDL_GetTicks());
                 // Capture audio and feed to projectM (with gain applied)
@@ -1006,6 +1153,7 @@ int main(int argc, char* argv[])
             }
             break;
         }
+        }
 
         // Render UI overlay if visible (draws on top of everything)
         if (g_menu.isVisible()) {
@@ -1013,6 +1161,9 @@ int main(int argc, char* argv[])
             if (action != MenuAction::None)
                 handleMenuAction(action);
         }
+
+        // Always render toasts (even when menu is hidden)
+        g_menu.renderToasts();
 
         SDL_GL_SwapWindow(g_window);
 

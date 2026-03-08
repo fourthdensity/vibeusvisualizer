@@ -24,6 +24,9 @@ VibeusConfig loadConfig(const std::string& path)
         get("presetDuration",  cfg.presetDuration);
         get("shuffle",         cfg.shuffle);
         get("transitionTime",  cfg.transitionTime);
+        get("hardCutEnabled",   cfg.hardCutEnabled);
+        get("hardCutSensitivity", cfg.hardCutSensitivity);
+        get("hardCutDuration",  cfg.hardCutDuration);
         get("fullscreen",      cfg.fullscreen);
         get("uiScale",         cfg.uiScale);
         get("showFps",         cfg.showFps);
@@ -34,6 +37,7 @@ VibeusConfig loadConfig(const std::string& path)
         get("speedMultiplier", cfg.speedMultiplier);
         get("gamepadDeadzone", cfg.gamepadDeadzone);
         get("flowMode",        cfg.flowMode);
+        get("overlayOpacity",  cfg.overlayOpacity);
 
         // Enums stored as ints
         if (j.contains("perfMode")) {
@@ -61,6 +65,9 @@ bool saveConfig(const VibeusConfig& cfg, const std::string& path)
     j["presetDuration"]  = cfg.presetDuration;
     j["shuffle"]         = cfg.shuffle;
     j["transitionTime"]  = cfg.transitionTime;
+    j["hardCutEnabled"]   = cfg.hardCutEnabled;
+    j["hardCutSensitivity"] = cfg.hardCutSensitivity;
+    j["hardCutDuration"]  = cfg.hardCutDuration;
     j["fullscreen"]      = cfg.fullscreen;
     j["uiScale"]         = cfg.uiScale;
     j["showFps"]         = cfg.showFps;
@@ -73,6 +80,7 @@ bool saveConfig(const VibeusConfig& cfg, const std::string& path)
     j["speedMultiplier"] = cfg.speedMultiplier;
     j["gamepadDeadzone"] = cfg.gamepadDeadzone;
     j["flowMode"]        = cfg.flowMode;
+    j["overlayOpacity"]  = cfg.overlayOpacity;
 
     std::ofstream f(path);
     if (!f.is_open()) return false;
@@ -91,6 +99,7 @@ void applyMoodPreset(VibeusConfig& cfg, MoodPreset mood)
         cfg.speedMultiplier = 0.8f;
         cfg.reducedMotion   = false;
         cfg.flashLimiter    = false;
+        cfg.hardCutEnabled  = false;
         break;
     case MoodPreset::Party:
         cfg.audioGain       = 1.50f;
@@ -98,6 +107,9 @@ void applyMoodPreset(VibeusConfig& cfg, MoodPreset mood)
         cfg.presetDuration  = 20.0f;
         cfg.transitionTime  = 1.5f;
         cfg.speedMultiplier = 1.2f;
+        cfg.hardCutEnabled  = true;
+        cfg.hardCutSensitivity = 1.5f;
+        cfg.hardCutDuration = 10.0f;
         break;
     case MoodPreset::Focus:
         cfg.audioGain       = 0.60f;
@@ -106,6 +118,7 @@ void applyMoodPreset(VibeusConfig& cfg, MoodPreset mood)
         cfg.transitionTime  = 8.0f;
         cfg.speedMultiplier = 0.6f;
         cfg.reducedMotion   = true;
+        cfg.hardCutEnabled  = false;
         break;
     case MoodPreset::Psychedelic:
         cfg.audioGain       = 1.20f;
@@ -113,6 +126,9 @@ void applyMoodPreset(VibeusConfig& cfg, MoodPreset mood)
         cfg.presetDuration  = 25.0f;
         cfg.transitionTime  = 3.0f;
         cfg.speedMultiplier = 1.0f;
+        cfg.hardCutEnabled  = true;
+        cfg.hardCutSensitivity = 2.0f;
+        cfg.hardCutDuration = 15.0f;
         break;
     case MoodPreset::Custom:
         break; // leave everything as-is

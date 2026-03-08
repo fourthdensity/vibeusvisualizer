@@ -9,6 +9,7 @@
 #include <vector>
 #include <set>
 #include <cstdint>
+#include <deque>
 
 // Which screen the UI is showing
 enum class UIScreen {
@@ -74,6 +75,10 @@ public:
     void setSettingsReturnScreen(UIScreen screen) { m_settingsReturnTo = screen; }
     UIScreen settingsReturnScreen() const { return m_settingsReturnTo; }
 
+    // Toast notifications — brief confirmations shown over the visualizer
+    void showToast(const char* message, float durationSec = 2.0f);
+    void renderToasts(); // call every frame (even when UI is hidden)
+
 private:
     UIScreen m_screen = UIScreen::None;
     SDL_Window* m_window = nullptr;
@@ -96,6 +101,14 @@ private:
     VibeusConfig* m_config = nullptr;
     int m_settingsTab = 0;                           // 0=Basic, 1=Advanced
     UIScreen m_settingsReturnTo = UIScreen::MainMenu;
+
+    // Toast state
+    struct Toast {
+        std::string message;
+        Uint32 startMs;
+        float durationSec;
+    };
+    std::deque<Toast> m_toasts;
 
     void applyStyle();
 

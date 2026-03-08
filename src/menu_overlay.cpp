@@ -122,6 +122,84 @@ void MenuOverlay::drawBackdrop(float alpha)
     ImGui::PopStyleColor();
 }
 
+// ─── Toast Notifications ────────────────────────────────────────────
+
+void MenuOverlay::showToast(const char* message, float durationSec)
+{
+    m_toasts.push_back({ message, SDL_GetTicks(), durationSec });
+    // Keep at most 4 toasts visible
+    while (m_toasts.size() > 4)
+        m_toasts.pop_front();
+}
+
+void MenuOverlay::renderToasts()
+{
+    if (m_toasts.empty()) return;
+
+    // Start an ImGui frame only if one isn't already active
+    bool needFrame = (m_screen == UIScreen::None);
+    if (needFrame) {
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplSDL2_NewFrame();
+        ImGui::NewFrame();
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    float yOffset = io.DisplaySize.y - 60.0f;
+    Uint32 now = SDL_GetTicks();
+
+    for (auto it = m_toasts.begin(); it != m_toasts.end(); ) {
+        float elapsed = (now - it->startMs) / 1000.0f;
+        if (elapsed >= it->durationSec) {
+            it = m_toasts.erase(it);
+            continue;
+        }
+
+        // Fade in (first 0.2s) and out (last 0.4s)
+        float alpha = 1.0f;
+        if (elapsed < 0.2f)
+            alpha = elapsed / 0.2f;
+        else if (elapsed > it->durationSec - 0.4f)
+            alpha = (it->durationSec - elapsed) / 0.4f;
+
+        ImVec2 textSize = ImGui::CalcTextSize(it->message.c_str());
+        float padX = 20.0f, padY = 10.0f;
+        float boxW = textSize.x + padX * 2;
+        float boxH = textSize.y + padY * 2;
+        float boxX = (io.DisplaySize.x - boxW) * 0.5f;
+
+        ImGui::SetNextWindowPos(ImVec2(boxX, yOffset - boxH));
+        ImGui::SetNextWindowSize(ImVec2(boxW, boxH));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.08f, 0.08f, 0.18f, 0.85f * alpha));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.45f, 0.55f, 1.0f, 0.3f * alpha));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
+
+        char winId[64];
+        snprintf(winId, sizeof(winId), "##toast_%u", it->startMs);
+        ImGui::Begin(winId, nullptr,
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.75f, 0.85f, 1.0f, alpha));
+        ImGui::SetCursorPos(ImVec2(padX, padY));
+        ImGui::TextUnformatted(it->message.c_str());
+        ImGui::PopStyleColor();
+
+        ImGui::End();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(2);
+
+        yOffset -= boxH + 8.0f;
+        ++it;
+    }
+
+    if (needFrame) {
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    }
+}
+
 void MenuOverlay::drawCenteredTitle(const char* title, const char* subtitle)
 {
     ImVec2 winSize = ImGui::GetWindowSize();
@@ -556,7 +634,9 @@ MenuAction MenuOverlay::renderPresetBrowser()
 
 MenuAction MenuOverlay::renderSettings()
 {
-    drawBackdrop(0.92f);
+    // Use configurable glass opacity so the live visualizer shows through
+    float opacity = m_config ? m_config->overlayOpacity : 0.65f;
+    drawBackdrop(opacity * 0.5f); // light tint behind the panel
 
     ImGuiIO& io = ImGui::GetIO();
     ImVec2 ds = io.DisplaySize;
@@ -565,6 +645,10 @@ MenuAction MenuOverlay::renderSettings()
     ImVec2 panelSize(std::min(ds.x - margin * 2, 620.0f), ds.y - margin * 2);
     if (panelSize.y < 400) panelSize.y = 400;
     ImVec2 panelPos((ds.x - panelSize.x) * 0.5f, (ds.y - panelSize.y) * 0.5f);
+
+    // Push glass-panel window background using the overlay opacity
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.05f, 0.11f, opacity));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg,  ImVec4(0.04f, 0.04f, 0.09f, opacity * 0.6f));
 
     ImGui::SetNextWindowPos(panelPos);
     ImGui::SetNextWindowSize(panelSize);
@@ -631,26 +715,35 @@ MenuAction MenuOverlay::renderSettings()
                 }
             }
 
-            // ── Vibe Lock ──
-            if (m_config->vibeLock) {
-                ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f, 0.45f, 0.25f, 0.80f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.20f, 0.55f, 0.30f, 0.90f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.25f, 0.65f, 0.35f, 1.00f));
-                if (ImGui::Button("Vibe Locked", ImVec2(contentW, 40))) {
-                    m_config->vibeLock = false;
+            // ── Lock Current Preset ──
+            {
+                bool locked = m_config->vibeLock;
+
+                // Visual indicator: colored bar + clear state label
+                if (locked) {
+                    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.15f, 0.45f, 0.25f, 0.80f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.20f, 0.55f, 0.30f, 0.90f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.25f, 0.65f, 0.35f, 1.00f));
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.20f, 0.20f, 0.28f, 0.60f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.25f, 0.25f, 0.35f, 0.70f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.30f, 0.30f, 0.40f, 0.80f));
+                }
+
+                const char* label = locked
+                    ? ">> Preset Locked — Click to Unlock <<"
+                    : "Lock Current Preset";
+                if (ImGui::Button(label, ImVec2(contentW, 40))) {
+                    m_config->vibeLock = !locked;
+                    showToast(m_config->vibeLock ? "Preset Locked" : "Preset Unlocked");
                     changed = true;
                 }
                 ImGui::PopStyleColor(3);
-            } else {
-                if (ImGui::Button("Vibe Lock", ImVec2(contentW, 40))) {
-                    m_config->vibeLock = true;
-                    changed = true;
-                }
             }
             ImGui::SameLine();
             ImGui::TextDisabled("(?)");
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Vibe Lock freezes preset switching.\nThe current preset plays forever.");
+                ImGui::SetTooltip("Locks the current preset so it keeps playing\nindefinitely. Auto-advance and manual skip are\ndisabled while locked. Click again to unlock.");
             }
 
             ImGui::Spacing();
@@ -665,12 +758,18 @@ MenuAction MenuOverlay::renderSettings()
                     m_config->mood = MoodPreset::Custom;
                     changed = true;
                 }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("How loud the audio signal is for the visualizer.\nHigher = more reactive visuals. 100%% is default.");
 
                 ImGui::SetNextItemWidth(contentW * 0.65f);
                 if (ImGui::SliderFloat("Beat Sensitivity", &m_config->beatSensitivity, 0.0f, 5.0f, "%.1f")) {
                     m_config->mood = MoodPreset::Custom;
                     changed = true;
                 }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("How strongly the visuals react to beats.\nLow = mellow, High = intense.");
             }
 
             ImGui::Spacing();
@@ -680,6 +779,9 @@ MenuAction MenuOverlay::renderSettings()
             {
                 if (ImGui::Checkbox("Auto-Advance", &m_config->autoAdvance))
                     changed = true;
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Automatically switch to the next preset\nafter the duration expires.");
 
                 if (m_config->autoAdvance) {
                     ImGui::SetNextItemWidth(contentW * 0.65f);
@@ -687,15 +789,53 @@ MenuAction MenuOverlay::renderSettings()
                         m_config->mood = MoodPreset::Custom;
                         changed = true;
                     }
+                    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("How long each preset plays before\nswitching to the next one.");
                 }
 
                 if (ImGui::Checkbox("Shuffle", &m_config->shuffle))
                     changed = true;
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Randomize preset order instead of\nplaying them sequentially.");
 
                 ImGui::SetNextItemWidth(contentW * 0.65f);
                 if (ImGui::SliderFloat("Transition Time", &m_config->transitionTime, 0.0f, 10.0f, "%.1f sec")) {
                     m_config->mood = MoodPreset::Custom;
                     changed = true;
+                }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("How long the crossfade lasts when\nswitching between presets.");
+
+                // ── Beat-Reactive Hard Cuts ──
+                if (ImGui::Checkbox("Beat-Reactive Cuts", &m_config->hardCutEnabled))
+                    changed = true;
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("When enabled, a loud beat can\ntrigger an instant preset change\ninstead of a smooth crossfade.");
+
+                if (m_config->hardCutEnabled) {
+                    ImGui::SetNextItemWidth(contentW * 0.65f);
+                    if (ImGui::SliderFloat("Cut Sensitivity", &m_config->hardCutSensitivity, 0.5f, 4.0f, "%.1f")) {
+                        m_config->mood = MoodPreset::Custom;
+                        changed = true;
+                    }
+                    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Volume threshold to trigger an instant\ncut. Lower = more frequent cuts.");
+
+                    ImGui::SetNextItemWidth(contentW * 0.65f);
+                    int cutDelay = static_cast<int>(m_config->hardCutDuration);
+                    if (ImGui::SliderInt("Min Time Before Cut", &cutDelay, 5, 60, "%d sec")) {
+                        m_config->hardCutDuration = static_cast<float>(cutDelay);
+                        m_config->mood = MoodPreset::Custom;
+                        changed = true;
+                    }
+                    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Minimum seconds a preset plays\nbefore a beat can trigger an\ninstant cut to the next one.");
                 }
             }
 
@@ -706,9 +846,15 @@ MenuAction MenuOverlay::renderSettings()
             {
                 if (ImGui::Checkbox("Fullscreen", &m_config->fullscreen))
                     changed = true;
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Toggle between windowed and fullscreen mode.\nAlso available with F11.");
 
                 if (ImGui::Checkbox("Show FPS", &m_config->showFps))
                     changed = true;
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Display frames-per-second counter\nin the window title bar.");
 
                 const char* perfModes[] = { "Battery Saver", "Balanced", "Quality" };
                 int pmIdx = static_cast<int>(m_config->perfMode);
@@ -717,6 +863,20 @@ MenuAction MenuOverlay::renderSettings()
                     m_config->perfMode = static_cast<PerfMode>(pmIdx);
                     changed = true;
                 }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Battery Saver = lower quality, less GPU usage.\nBalanced = good mix of quality and performance.\nQuality = maximum visual fidelity.");
+
+                // ── Overlay Glass Opacity ──
+                int opacityPct = static_cast<int>(m_config->overlayOpacity * 100.0f);
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::SliderInt("Overlay Opacity", &opacityPct, 10, 95, "%d%%")) {
+                    m_config->overlayOpacity = opacityPct / 100.0f;
+                    changed = true;
+                }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Glass transparency of this settings panel.\nLower = more see-through, so you can\nwatch the visualizer while tuning.");
             }
 
             ImGui::Spacing();
@@ -726,11 +886,15 @@ MenuAction MenuOverlay::renderSettings()
             {
                 if (ImGui::Checkbox("Flash Limiter", &m_config->flashLimiter))
                     changed = true;
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Limits rapid brightness changes\nto reduce photosensitivity risk.");
 
                 if (ImGui::Checkbox("Reduced Motion", &m_config->reducedMotion))
                     changed = true;
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Slows down animations and reduces\nrapid visual movement for comfort.");
 
                 int fontPct = static_cast<int>(m_config->fontScale * 100.0f);
                 ImGui::SetNextItemWidth(contentW * 0.5f);
@@ -738,6 +902,9 @@ MenuAction MenuOverlay::renderSettings()
                     m_config->fontScale = fontPct / 100.0f;
                     changed = true;
                 }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Scale all UI text larger or smaller.\nUseful for high-DPI displays or\ncouch/TV viewing distance.");
             }
 
             ImGui::Spacing();
@@ -754,6 +921,8 @@ MenuAction MenuOverlay::renderSettings()
                 changed = true;
             }
             ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Restore all settings to their original values.");
 
             ImGui::EndChild();
             ImGui::EndTabItem();
@@ -773,6 +942,9 @@ MenuAction MenuOverlay::renderSettings()
                     m_config->mood = MoodPreset::Custom;
                     changed = true;
                 }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Multiplier for animation time.\n1x = normal, <1 = slow-mo, >1 = fast-forward.\nAffects how quickly visuals evolve.");
 
                 int uiPct = static_cast<int>(m_config->uiScale * 100.0f);
                 ImGui::SetNextItemWidth(contentW * 0.65f);
@@ -780,6 +952,9 @@ MenuAction MenuOverlay::renderSettings()
                     m_config->uiScale = uiPct / 100.0f;
                     changed = true;
                 }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Scale factor for all UI elements.\nIncrease for TV/couch use or\nhigh-DPI displays.");
             }
 
             ImGui::Spacing();
@@ -789,12 +964,16 @@ MenuAction MenuOverlay::renderSettings()
             {
                 if (ImGui::Checkbox("Flow Mode", &m_config->flowMode))
                     changed = true;
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Mouse position controls animation speed\nand generates touch waveforms.");
+                    ImGui::SetTooltip("Mouse position controls animation speed\nand generates touch waveforms.\nMove the mouse around to interact.");
 
                 ImGui::SetNextItemWidth(contentW * 0.65f);
                 if (ImGui::SliderInt("Gamepad Deadzone", &m_config->gamepadDeadzone, 2000, 16000))
                     changed = true;
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Minimum stick movement before input registers.\nIncrease if you see drift, decrease for\nmore responsive stick control.");
             }
 
             ImGui::Spacing();
@@ -812,6 +991,7 @@ MenuAction MenuOverlay::renderSettings()
     }
 
     ImGui::End();
+    ImGui::PopStyleColor(2); // WindowBg + ChildBg
 
     // If anything changed and we haven't already requested a back action
     if (changed && action == MenuAction::None)

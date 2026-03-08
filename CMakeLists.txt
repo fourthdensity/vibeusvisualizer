@@ -116,5 +116,16 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMENT "Copying projectM DLLs to output directory"
 )
 
+# --- Post-build: copy textures (if available) ---
+set(TEXTURE_PACK_DIR "${CMAKE_SOURCE_DIR}/../presets-milkdrop-texture-pack/textures")
+if(EXISTS "${TEXTURE_PACK_DIR}")
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${TEXTURE_PACK_DIR}"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/textures"
+        COMMENT "Copying Milkdrop texture pack to output directory"
+    )
+endif()
+
 # Install target (basic)
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
