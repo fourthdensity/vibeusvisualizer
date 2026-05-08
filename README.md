@@ -27,6 +27,7 @@ A real-time music visualizer that reacts to whatever audio is playing on your sy
 | `-` / `=` | Audio gain down / up |
 | `0` | Reset audio gain to 100% |
 | `D` | Toggle debug overlay |
+| `I` | Toggle beat indicator (red circle flashes on beats) |
 | Mouse click/drag | Spawn touch waveforms |
 | `Q` / `Esc` | Quit |
 

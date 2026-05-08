@@ -3,6 +3,7 @@ project(Vibeus VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # --- Dependencies ---
 
@@ -67,17 +68,21 @@ set(SOURCES
     src/main.cpp
     src/audio_capture.cpp
     src/preset_manager.cpp
+    src/preset_database.cpp
     src/menu_overlay.cpp
     src/config.cpp
     src/imgui_impl_sdl2.cpp
+    src/storyteller.cpp
 )
 
 set(HEADERS
     src/audio_capture.h
     src/preset_manager.h
+    src/preset_database.h
     src/menu_overlay.h
     src/config.h
     src/imgui_impl_sdl2.h
+    src/storyteller.h
 )
 
 # --- Executable ---

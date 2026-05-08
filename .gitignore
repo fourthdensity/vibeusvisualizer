@@ -29,6 +29,15 @@ Desktop.ini
 # vcpkg local installs (use vcpkg.json manifest instead)
 vcpkg_installed/
 
+# GSD (GitHub Copilot Session Data) - internal state, not for version control
+.gsd/
+.bg-shell/
+
+# Temporary / backup files
+*.bak
+*.log
+bridge_mcp.js
+
 # Preset files (large, from external repo - don't bundle)
 presets/
 

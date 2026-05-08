@@ -4,6 +4,7 @@
 #include <projectM-4/playlist.h>
 
 #include "config.h"
+#include "preset_database.h"
 
 #include <string>
 #include <vector>
@@ -36,6 +37,8 @@ enum class MenuAction {
     BackToPause,
     ApplySettings,
     BackFromSettings,
+    ApplyTransitionSettings,  // force immediate push of transitionTime / hardcut / storyteller
+    ShowControls,             // open Settings and jump directly to the Controls tab
 };
 
 class MenuOverlay {
@@ -58,13 +61,21 @@ public:
     // Preset browser: load preset list from playlist manager
     void loadPresetList(projectm_playlist_handle playlist);
 
-    // Preset browser: get the selected preset index (valid after PlayPreset action)
+    // Preset browser: get the selected browser/database index (legacy fallback)
     uint32_t selectedPresetIndex() const { return m_selectedPreset; }
+
+    // Preset browser: get selected preset path for safe playlist reconciliation.
+    // PresetDatabase indices and projectM playlist positions are not guaranteed to match.
+    std::string selectedPresetPath() const;
 
     // Favorites management
     const std::set<uint32_t>& favorites() const { return m_favorites; }
     bool isFavorite(uint32_t idx) const { return m_favorites.count(idx) > 0; }
     void toggleFavorite(uint32_t idx);
+
+    // Bulk favorites operations (for "Select All" in browser)
+    void addAllVisibleToFavorites(const std::vector<uint32_t>& visibleIndices);
+    void removeAllVisibleFromFavorites(const std::vector<uint32_t>& visibleIndices);
 
     // Save/load favorites to disk
     void saveFavorites(const std::string& path);
@@ -72,12 +83,34 @@ public:
 
     // Settings: point at the app's config struct (non-owning)
     void setConfigPtr(VibeusConfig* cfg) { m_config = cfg; }
+    void setUserDataDir(const std::string& path) { m_userDataDir = path; }
+
+    // Settings: jump to a specific tab by index (0=Audio&Beat, 1=Presets, 2=Visuals, 3=Advanced, 4=Controls)
+    void jumpToSettingsTab(int tabIndex) { m_settingsTabTarget = tabIndex; }
+
+    // Live status for the settings panel (called every frame from main)
+    void setLiveStatus(const std::string& presetName, const std::string& storyState,
+                       float beatSens, bool stasisActive);
     void setSettingsReturnScreen(UIScreen screen) { m_settingsReturnTo = screen; }
     UIScreen settingsReturnScreen() const { return m_settingsReturnTo; }
+
+    // Preset database for rich categorized browsing (non-owning)
+    void setPresetDatabase(PresetDatabase* db) { m_presetDb = db; }
 
     // Toast notifications — brief confirmations shown over the visualizer
     void showToast(const char* message, float durationSec = 2.0f);
     void renderToasts(); // call every frame (even when UI is hidden)
+
+    // Visual beat indicator — call every frame during visualization
+    void renderBeatIndicator(float alpha);
+
+    // Lightweight storyteller HUD overlay (state + ratios)
+    void renderStoryOverlay(const char* stateLabel, float energyRatio, float flux);
+
+    // Control remapping state
+    bool isRemappingControl() const { return m_remappingActive; }
+    void setRemappingControl(const char* controlName, int* bindingPtr, bool isGamepad);
+    void cancelRemapping() { m_remappingActive = false; }
 
 private:
     UIScreen m_screen = UIScreen::None;
@@ -93,14 +126,26 @@ private:
     std::vector<PresetEntry> m_presetList;
     char m_searchBuf[256] = {};
     uint32_t m_selectedPreset = 0;
+    std::string m_selectedPresetPath;
     std::set<uint32_t> m_favorites;
     bool m_showFavoritesOnly = false;
     UIScreen m_browserReturnTo = UIScreen::MainMenu; // where to go back to
 
+    PresetDatabase* m_presetDb = nullptr;   // for category-aware browsing
+    PresetCategory m_currentCategory = PresetCategory::All;
+
     // Settings state
     VibeusConfig* m_config = nullptr;
+    std::string m_userDataDir;
     int m_settingsTab = 0;                           // 0=Basic, 1=Advanced
+    int m_settingsTabTarget = -1;                    // -1 = no pending jump; set to tab index to activate on next render
     UIScreen m_settingsReturnTo = UIScreen::MainMenu;
+
+    // Live status (updated every frame from main loop)
+    std::string m_livePresetName = "—";
+    std::string m_liveStoryState = "CHILL";
+    float       m_liveBeatSens   = 1.0f;
+    bool        m_liveStasis     = false;
 
     // Toast state
     struct Toast {
@@ -109,6 +154,13 @@ private:
         float durationSec;
     };
     std::deque<Toast> m_toasts;
+    bool m_frameActive = false;  // tracks whether an ImGui frame is open
+
+    // Control remapping
+    bool  m_remappingActive = false;
+    const char* m_remappingControl = "";
+    int*  m_remappingBindingPtr = nullptr;
+    bool  m_remappingIsGamepad = false;
 
     void applyStyle();
 

@@ -10,6 +10,7 @@
  *   F / F11         - Toggle fullscreen
  *   Up/Down         - Adjust beat sensitivity
  *   D               - Toggle debug overlay
+ *   I               - Toggle beat indicator (red circle flashes on beats)
  *   [ / ]           - Slow down / speed up visualization
  *   Backspace       - Reset speed to 1.0x
  *   - / =           - Audio reactivity down / up
@@ -45,10 +46,13 @@
 #include <SDL_opengl.h>
 
 #include <projectM-4/projectM.h>
+#include <projectM-4/parameters.h>
 #include <projectM-4/playlist.h>
 
 #include "audio_capture.h"
 #include "preset_manager.h"
+#include "preset_database.h"
+#include "storyteller.h"
 #include "menu_overlay.h"
 #include "config.h"
 
@@ -79,14 +83,21 @@ static projectm_handle g_pm     = nullptr;
 static bool          g_running  = true;
 static bool          g_fullscreen = false;
 static bool          g_debug    = false;
+static bool          g_inStasis = false;
 
 static AudioCapture  g_audio;
 static PresetManager g_presets;
 static MenuOverlay   g_menu;
+static PresetDatabase g_presetDb;   // category-aware preset index (for browser)
+Storyteller g_storyteller;
 
 // Configuration (persisted to JSON)
 static VibeusConfig  g_config;
+static std::string   g_userDataDir;
 static std::string   g_configPath;
+static std::string   g_favoritesPath;
+static std::string   g_brokenPresetBlacklistPath;
+static std::string   g_userBlacklistPath;
 
 // App state machine: Splash → MainMenu → Visualizer (with pause overlay)
 enum class AppState { Splash, MainMenu, Visualizer };
@@ -96,6 +107,10 @@ static AppState g_appState = AppState::Splash;
 static bool          g_paused    = false;
 static double        g_pausedTime = 0.0;
 static int           g_pauseRenderCount = 0;
+
+// Global state for beat indicator
+static bool          g_showBeatIndicator = false;
+static float         g_beatIndicatorAlpha = 0.0f;
 
 // Debug stats
 static Uint32 g_frameCount  = 0;
@@ -109,6 +124,14 @@ static Uint32 g_lastFrameTicks  = 0;
 
 // Audio dampening - scales PCM amplitude before feeding to projectM
 static float  g_audioGain       = 1.0f;   // 0.0 (muted) to 3.0 (boosted)
+
+// Accessibility flags (applied at runtime, synced from config)
+static bool   g_flashLimiter    = false;  // caps audio gain and beat sensitivity to reduce flashing
+static bool   g_reducedMotion   = false;  // applies 0.5x factor to animation speed
+
+// Forward declaration for centralized beat sensitivity helper (defined later, before applyConfig)
+static void setBeatSensitivity(float value, const char* reason);
+
 
 // Mouse / touch waveform state
 static bool   g_mouseDown       = false;
@@ -129,7 +152,7 @@ static constexpr int g_touchTypeCount = sizeof(g_touchTypes) / sizeof(g_touchTyp
 
 // Gamepad
 static SDL_GameController* g_gamepad = nullptr;
-static const int STICK_DEADZONE = 8000;  // out of 32768
+// Deadzone now configurable via settings (removed hardcoded constant)
 
 // Flow mode: mouse position controls speed + creates waveforms
 static bool  g_flowMode = false;
@@ -281,27 +304,61 @@ static const char* logLevelStr(projectm_log_level level)
     }
 }
 
+// Global flag to track if current preset has compilation/runtime load errors
+bool g_lastPresetHadError = false;
+
+// When true, any projectM ERROR log will mark the current preset as broken.
+// This is enabled during preset validation scans.
+bool g_captureProjectMErrors = false;
+FILE* g_validationLogFile = nullptr;
+
 static void projectmLogCallback(const char* message, projectm_log_level level, void* /*userData*/)
 {
     fprintf(stderr, "[projectM/%s] %s\n", logLevelStr(level), message);
+    if (g_validationLogFile) {
+        fprintf(g_validationLogFile, "[projectM/%s] %s\n", logLevelStr(level), message);
+        fflush(g_validationLogFile);
+    }
+    
+    // During validation scans, treat ANY ERROR as a broken preset.
+    // This catches shader compile errors *and* per-frame/per-pixel compile failures.
+    if (g_captureProjectMErrors && level == PROJECTM_LOG_LEVEL_ERROR) {
+        g_lastPresetHadError = true;
+    }
 }
 
 static void updateDebugTitle()
 {
-    if (!g_debug) return;
+    if (!g_debug && !g_config.storyDebug) return;
     std::string preset = g_presets.currentPresetName();
     // Extract just the filename
     auto pos = preset.find_last_of("/\\");
     if (pos != std::string::npos)
         preset = preset.substr(pos + 1);
+
     char title[512];
-    snprintf(title, sizeof(title),
-             "Vibeus | %.0f FPS | %.2fx speed | %.0f%% audio | Touch: %s P%d | %s%s[%u/%u] %s",
-             g_currentFps, g_speedMultiplier, g_audioGain * 100.0f,
-             touchTypeName(g_touchTypes[g_touchTypeIndex]), g_touchPressure,
-             g_flowMode ? "FLOW | " : "",
-             g_gamepad ? "GAMEPAD | " : "",
-             g_presets.position() + 1, g_presets.count(), preset.c_str());
+    if (g_config.storyDebug) {
+        const char* s = (g_storyteller.currentState() == StoryState::Chill) ? "CHILL" : 
+                        (g_storyteller.currentState() == StoryState::Buildup) ? "BUILD" :
+                        (g_storyteller.currentState() == StoryState::Drop) ? "DROP" : "SUSTAIN";
+        snprintf(title, sizeof(title),
+                 "Vibeus [STORY] | %.0f FPS | State: %s | Kick: %.2f | Thresh: %.2f | Flux: %.2f | Trg: %s | P[%u/%u] %s",
+                 g_currentFps, s, 
+                 g_audio.levelBeatBass(), g_storyteller.beatThreshold(), g_storyteller.spectralFlux(),
+                 g_storyteller.beatActive() ? "YES" : " no",
+                 g_presets.position() + 1, g_presets.count(), preset.c_str());
+    } else {
+        float rms = g_audio.levelRms();
+        float peak = g_audio.levelPeak();
+        snprintf(title, sizeof(title),
+                 "Vibeus | %.0f FPS | %.2fx speed | %.0f%% gain | In %.2f pk %.2f | Touch: %s P%d | %s%s[%u/%u] %s",
+                 g_currentFps, g_speedMultiplier, g_audioGain * 100.0f,
+                 rms, peak,
+                 touchTypeName(g_touchTypes[g_touchTypeIndex]), g_touchPressure,
+                 g_flowMode ? "FLOW | " : "",
+                 g_gamepad ? "GAMEPAD | " : "",
+                 g_presets.position() + 1, g_presets.count(), preset.c_str());
+    }
     SDL_SetWindowTitle(g_window, title);
 }
 
@@ -327,7 +384,9 @@ static void updateVirtualTime(Uint32 nowTicks)
     g_lastFrameTicks = nowTicks;
     // Cap delta to prevent jumps (e.g. after resume or stall)
     if (realDelta > 0.1) realDelta = 0.1;
-    g_virtualTime += realDelta * g_speedMultiplier;
+    double effectiveSpeed = g_speedMultiplier * (g_reducedMotion ? 0.5 : 1.0);
+    if (effectiveSpeed < 0.05) effectiveSpeed = 0.05;
+    g_virtualTime += realDelta * effectiveSpeed;
     projectm_set_frame_time(g_pm, g_virtualTime);
 }
 
@@ -398,7 +457,7 @@ static float stickAxis(SDL_GameControllerAxis axis)
 {
     if (!g_gamepad) return 0.0f;
     int raw = SDL_GameControllerGetAxis(g_gamepad, axis);
-    if (abs(raw) < STICK_DEADZONE) return 0.0f;
+    if (abs(raw) < g_config.gamepadDeadzone) return 0.0f;  // Use config value
     return static_cast<float>(raw) / 32768.0f;
 }
 
@@ -419,15 +478,17 @@ static void processGamepad()
         if (g_speedMultiplier > 4.0)  g_speedMultiplier = 4.0;
     }
 
-    // Right stick = touch waveform control
-    float rx = stickAxis(SDL_CONTROLLER_AXIS_RIGHTX);
-    float ry = stickAxis(SDL_CONTROLLER_AXIS_RIGHTY);
-    if (fabsf(rx) > 0.0f || fabsf(ry) > 0.0f) {
-        float nx = 0.5f + rx * 0.5f;  // map -1..1 to 0..1
-        float ny = 0.5f + ry * 0.5f;
-        float magnitude = sqrtf(rx * rx + ry * ry);
-        int pressure = (magnitude > 0.7f) ? 2 : (magnitude > 0.3f) ? 1 : 0;
-        projectm_touch(g_pm, nx, ny, pressure, g_touchTypes[g_touchTypeIndex]);
+    // Right stick = touch waveform control [DISABLED]
+    if (false && g_config.touchEnabled) {
+        float rx = stickAxis(SDL_CONTROLLER_AXIS_RIGHTX);
+        float ry = stickAxis(SDL_CONTROLLER_AXIS_RIGHTY);
+        if (fabsf(rx) > 0.0f || fabsf(ry) > 0.0f) {
+            float nx = 0.5f + rx * 0.5f;  // map -1..1 to 0..1
+            float ny = 0.5f + ry * 0.5f;
+            float magnitude = sqrtf(rx * rx + ry * ry);
+            int pressure = (magnitude > 0.7f) ? 2 : (magnitude > 0.3f) ? 1 : 0;
+            projectm_touch(g_pm, nx, ny, pressure, g_touchTypes[g_touchTypeIndex]);
+        }
     }
 
     // Left stick X = fine speed adjustment
@@ -439,11 +500,11 @@ static void processGamepad()
     }
 }
 
-// ----- Flow Mode -----
+// ----- Flow Mode ----- [DISABLED]
 
 static void processFlowMode()
 {
-    if (!g_flowMode || g_paused || g_appState != AppState::Visualizer) return;
+    if (false || !g_flowMode || !g_config.touchEnabled || g_paused || g_appState != AppState::Visualizer) return;
 
     int mx, my;
     SDL_GetMouseState(&mx, &my);
@@ -487,10 +548,25 @@ static void attachConsole()
 
 // ----- Helpers -----
 
+static std::string getUserDataDir()
+{
+    // SDL_GetPrefPath returns a per-user writable directory and creates it if needed.
+    // This avoids crashes when installed under Program Files.
+    char* p = SDL_GetPrefPath("VibeusProject", "Vibeus");
+    if (!p) {
+        const char* b = SDL_GetBasePath();
+        return b ? fs::path(b).string() : std::string(".");
+    }
+    std::string result(p);
+    SDL_free(p);
+    return result;
+}
+
 static std::string findPresetsDir()
 {
     // Check common locations relative to the executable
-    auto exePath = fs::path(SDL_GetBasePath());
+    const char* base = SDL_GetBasePath();
+    auto exePath = fs::path(base ? base : "");
     std::string candidates[] = {
         (exePath / "presets").string(),
         (exePath / ".." / "presets").string(),
@@ -552,17 +628,28 @@ static bool initProjectM()
     projectm_get_version_components(&major, &minor, &patch);
     fprintf(stderr, "[Vibeus] projectM %d.%d.%d initialized\n", major, minor, patch);
 
+    // NOTE: Initialization uses some hardcoded defaults for first frame.
+    // Long-term goal (Phase 1): move all configurable values into applyConfig(g_config)
+    // so that restart + settings changes are always consistent.
     // Configure
     projectm_set_window_size(g_pm, DEFAULT_WIDTH, DEFAULT_HEIGHT);
     projectm_set_preset_duration(g_pm, PRESET_DURATION);
     projectm_set_soft_cut_duration(g_pm, SOFT_CUT_DURATION);
     projectm_set_hard_cut_duration(g_pm, HARD_CUT_DURATION);
     projectm_set_hard_cut_enabled(g_pm, true);
-    projectm_set_beat_sensitivity(g_pm, BEAT_SENSITIVITY);
+    setBeatSensitivity(BEAT_SENSITIVITY, "init");
+    projectm_set_mesh_size(g_pm, 64, 48); // higher res per-pixel mesh for better warp
 
     // Set texture search paths (for preset textures)
     std::string presetsDir = findPresetsDir();
-    auto exeDir = fs::path(SDL_GetBasePath());
+
+    // Load the rich category database (used by the preset browser UI)
+    uint32_t dbCount = g_presetDb.loadFromDirectory(presetsDir);
+    fprintf(stderr, "[Vibeus] PresetDatabase loaded %u presets across %zu categories\n",
+            dbCount, g_presetDb.categoryCount());
+
+    const char* base = SDL_GetBasePath();
+    auto exeDir = fs::path(base ? base : "");
     std::string texturesDir = (exeDir / "textures").string();
 
     // Search both a dedicated textures folder and the presets folder
@@ -589,104 +676,216 @@ static void toggleFullscreen()
             g_fullscreen ? "Fullscreen" : "Windowed", w, h);
 }
 
+static void toastInput(const char* msg, float durationSec = 0.8f)
+{
+    static Uint32 lastMs = 0;
+    static std::string lastMsg;
+    Uint32 now = SDL_GetTicks();
+
+    if (msg && lastMsg == msg && (now - lastMs) < 250)
+        return;
+
+    lastMsg = msg ? msg : "";
+    lastMs = now;
+
+    if (msg && msg[0])
+        g_menu.showToast(msg, durationSec);
+}
+
 static void handleKeyDown(SDL_Keysym key)
 {
     if (g_debug)
         fprintf(stderr, "[Vibeus] Key: %s (0x%x)\n", SDL_GetKeyName(key.sym), key.sym);
 
-    switch (key.sym) {
-    case SDLK_q:
+    const SDL_Keycode sym = key.sym;
+
+    if (sym == g_config.keyQuit) {
+        toastInput("Exiting...");
         g_running = false;
-        break;
+        return;
+    }
 
-    case SDLK_n:
-    case SDLK_RIGHT:
+    // Preset navigation
+    if (sym == g_config.keyNextPreset || sym == SDLK_RIGHT) {
         g_presets.next(false);
-        break;
-
-    case SDLK_p:
-    case SDLK_LEFT:
+        toastInput("Next preset");
+        return;
+    }
+    if (sym == g_config.keyPrevPreset || sym == SDLK_LEFT) {
         g_presets.previous(false);
-        break;
-
-    case SDLK_r:
+        toastInput("Previous preset");
+        return;
+    }
+    if (sym == g_config.keyRandomPreset) {
         g_presets.next(true); // hard cut = random jump
-        break;
-
-    case SDLK_h:
+        toastInput("Random preset");
+        return;
+    }
+    if (sym == g_config.keyHistory) {
         g_presets.last(false);
-        break;
-
-    case SDLK_s:
+        toastInput("History back");
+        return;
+    }
+    if (sym == g_config.keyShuffle) {
         g_presets.toggleShuffle();
-        g_menu.showToast(g_presets.isShuffled() ? "Shuffle ON" : "Shuffle OFF");
-        break;
+        toastInput(g_presets.isShuffled() ? "Shuffle ON" : "Shuffle OFF");
+        return;
+    }
 
-    case SDLK_d:
+    // Blacklist current preset (B key)
+    if (sym == SDLK_b) {
+        std::string removed = g_presets.blacklistCurrent(g_userBlacklistPath);
+        if (!removed.empty()) {
+            toastInput(("Blacklisted: " + removed).c_str());
+        }
+        return;
+    }
+
+    // Toggle favorite on current preset (F key) - quick access without menu
+    if (sym == SDLK_f) {
+        uint32_t currentIdx = g_presets.position();
+        g_menu.toggleFavorite(currentIdx);
+        bool nowFav = g_menu.isFavorite(currentIdx);
+        toastInput(nowFav ? "★ Added to Favorites" : "☆ Removed from Favorites");
+        return;
+    }
+
+    // Quarantine current preset (black screen / broken) - Q key
+    if (sym == SDLK_q) {
+        std::string removed = g_presets.blacklistCurrent(g_userBlacklistPath);
+        if (!removed.empty()) {
+            toastInput(("Quarantined (black screen): " + removed).c_str());
+            // Also try to add to the preset database quarantine if available
+            // (the database already has a quarantine list in some builds)
+        }
+        return;
+    }
+
+    // Debug display
+    if (sym == g_config.keyDebug) {
         g_debug = !g_debug;
-        if (!g_debug)
+        if (!g_debug && !g_config.storyDebug)
             SDL_SetWindowTitle(g_window, "Vibeus");
+        else
+            updateDebugTitle();
         fprintf(stderr, "[Vibeus] Debug display: %s\n", g_debug ? "ON" : "OFF");
-        g_menu.showToast(g_debug ? "Debug ON" : "Debug OFF");
-        break;
+        toastInput(g_debug ? "Debug ON" : "Debug OFF");
+        return;
+    }
+
+    // Storyteller Telemetry Toggle (L key)
+    if (sym == SDLK_l) {
+        g_config.storyDebug = !g_config.storyDebug;
+        if (!g_debug && !g_config.storyDebug)
+            SDL_SetWindowTitle(g_window, "Vibeus");
+        else
+            updateDebugTitle();
+        fprintf(stderr, "[Story] Real-time telemetry: %s\n", g_config.storyDebug ? "ON" : "OFF");
+        toastInput(g_config.storyDebug ? "Story Logs ON" : "Story Logs OFF");
+        return;
+    }
+
+    // Beat indicator toggle
+    if (sym == SDLK_i) { // Changed to I because B is used for Blacklist
+        g_showBeatIndicator = !g_showBeatIndicator;
+        toastInput(g_showBeatIndicator ? "Beat Indicator ON" : "Beat Indicator OFF");
+        return;
+    }
 
     // Speed control
-    case SDLK_LEFTBRACKET:  adjustSpeed(-0.05); break;
-    case SDLK_RIGHTBRACKET: adjustSpeed(+0.05); break;
-    case SDLK_BACKSPACE:    resetSpeed(); break;
+    if (sym == g_config.keySpeedDown) {
+        adjustSpeed(-0.05);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Speed %.2fx", g_speedMultiplier);
+        toastInput(buf, 0.7f);
+        return;
+    }
+    if (sym == g_config.keySpeedUp) {
+        adjustSpeed(+0.05);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Speed %.2fx", g_speedMultiplier);
+        toastInput(buf, 0.7f);
+        return;
+    }
+    if (sym == g_config.keySpeedReset) {
+        resetSpeed();
+        toastInput("Speed reset", 0.7f);
+        return;
+    }
 
     // Audio gain
-    case SDLK_MINUS:  adjustAudioGain(-0.1f); break;
-    case SDLK_EQUALS: adjustAudioGain(+0.1f); break;
-    case SDLK_0:      resetAudioGain(); break;
+    if (sym == g_config.keyAudioGainDown) {
+        adjustAudioGain(-0.1f);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Audio gain %.0f%%", g_audioGain * 100.0f);
+        toastInput(buf, 0.7f);
+        return;
+    }
+    if (sym == g_config.keyAudioGainUp) {
+        adjustAudioGain(+0.1f);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Audio gain %.0f%%", g_audioGain * 100.0f);
+        toastInput(buf, 0.7f);
+        return;
+    }
+    if (sym == g_config.keyAudioGainReset) {
+        resetAudioGain();
+        toastInput("Audio gain reset", 0.7f);
+        return;
+    }
 
-    // Touch waveforms
-    case SDLK_c:
-        projectm_touch_destroy_all(g_pm);
-        fprintf(stderr, "[Vibeus] Cleared all touch waveforms\n");
-        break;
-
-    // Flow mode toggle
-    case SDLK_TAB:
-        g_flowMode = !g_flowMode;
-        fprintf(stderr, "[Vibeus] Flow mode: %s\n", g_flowMode ? "ON" : "OFF");
-        g_menu.showToast(g_flowMode ? "Flow Mode ON" : "Flow Mode OFF");
-        if (!g_flowMode) {
-            // Reset speed when exiting flow mode
-            g_speedMultiplier = 1.0;
-        }
-        break;
-
-    case SDLK_f:
-    case SDLK_F11:
+    // Fullscreen
+    if (sym == g_config.keyFullscreen || sym == SDLK_F11) {
         toggleFullscreen();
-        g_menu.showToast(g_fullscreen ? "Fullscreen" : "Windowed");
-        break;
+        toastInput(g_fullscreen ? "Fullscreen" : "Windowed");
+        return;
+    }
 
-    case SDLK_UP: {
+    // F1 — show Controls tab (standard help-key convention)
+    if (sym == SDLK_F1) {
+        if (g_appState == AppState::Visualizer && g_paused)
+            g_menu.setSettingsReturnScreen(UIScreen::PauseMenu);
+        else
+            g_menu.setSettingsReturnScreen(UIScreen::MainMenu);
+        g_menu.jumpToSettingsTab(4);
+        g_menu.showScreen(UIScreen::Settings);
+        if (g_appState == AppState::Visualizer && !g_paused)
+            g_paused = true; // pause so the overlay is interactive
+        return;
+    }
+
+    // Beat sensitivity
+    if (sym == g_config.keyBeatSensUp) {
         float sens = projectm_get_beat_sensitivity(g_pm);
         sens = (sens < 4.9f) ? sens + 0.1f : 5.0f;
-        projectm_set_beat_sensitivity(g_pm, sens);
+        setBeatSensitivity(sens, "key");
         fprintf(stderr, "[Vibeus] Beat sensitivity: %.1f\n", sens);
-        break;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Beat sensitivity %.1f", sens);
+        toastInput(buf, 0.7f);
+        return;
     }
 
-    case SDLK_DOWN: {
+    if (sym == g_config.keyBeatSensDown) {
         float sens = projectm_get_beat_sensitivity(g_pm);
         sens = (sens > 0.1f) ? sens - 0.1f : 0.0f;
-        projectm_set_beat_sensitivity(g_pm, sens);
+        setBeatSensitivity(sens, "key");
         fprintf(stderr, "[Vibeus] Beat sensitivity: %.1f\n", sens);
-        break;
-    }
-
-    default:
-        break;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Beat sensitivity %.1f", sens);
+        toastInput(buf, 0.7f);
+        return;
     }
 }
 
 static void processEvents()
 {
     SDL_Event event;
+    if (g_lastPresetHadError && g_config.storyDebugRescue) {
+        fprintf(stderr, "[Vibeus] Auto-skipping broken preset...\n");
+        g_presets.next(false);
+        g_lastPresetHadError = false;
+    }
     while (SDL_PollEvent(&event)) {
         // Only forward events to ImGui when UI is visible
         if (g_menu.isVisible())
@@ -722,16 +921,26 @@ static void processEvents()
 
         // ESC toggles pause menu
         if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
-            if (g_paused) resumeFromPause();
-            else enterPause();
+            if (g_paused) {
+                resumeFromPause();
+                toastInput("Resumed");
+            } else {
+                enterPause();
+                toastInput("Paused");
+            }
             continue;
         }
 
         // Gamepad Start = pause menu
         if (event.type == SDL_CONTROLLERBUTTONDOWN &&
             event.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
-            if (g_paused) resumeFromPause();
-            else enterPause();
+            if (g_paused) {
+                resumeFromPause();
+                toastInput("Resumed");
+            } else {
+                enterPause();
+                toastInput("Paused");
+            }
             continue;
         }
 
@@ -740,40 +949,68 @@ static void processEvents()
 
         // Gamepad buttons (during active visualization)
         if (event.type == SDL_CONTROLLERBUTTONDOWN) {
-            switch (event.cbutton.button) {
-            case SDL_CONTROLLER_BUTTON_A:
+            const int btn = event.cbutton.button;
+
+            // Configurable buttons
+            if (btn == g_config.gpNextPreset) {
                 g_presets.next(false);
-                break;
-            case SDL_CONTROLLER_BUTTON_B:
+                toastInput("Next preset");
+                continue;
+            }
+            if (btn == g_config.gpPrevPreset) {
                 g_presets.previous(false);
-                break;
-            case SDL_CONTROLLER_BUTTON_X:
+                toastInput("Previous preset");
+                continue;
+            }
+            if (btn == g_config.gpRandomPreset) {
                 g_presets.next(true); // hard cut
-                break;
-            case SDL_CONTROLLER_BUTTON_Y:
+                toastInput("Random preset");
+                continue;
+            }
+            if (btn == g_config.gpShuffle) {
                 g_presets.toggleShuffle();
-                break;
-            case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:
+                toastInput(g_presets.isShuffled() ? "Shuffle ON" : "Shuffle OFF");
+                continue;
+            }
+            if (btn == g_config.gpAudioGainDown) {
                 adjustAudioGain(-0.1f);
-                break;
-            case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER:
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Audio gain %.0f%%", g_audioGain * 100.0f);
+                toastInput(buf, 0.7f);
+                continue;
+            }
+            if (btn == g_config.gpAudioGainUp) {
                 adjustAudioGain(+0.1f);
-                break;
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Audio gain %.0f%%", g_audioGain * 100.0f);
+                toastInput(buf, 0.7f);
+                continue;
+            }
+
+            // Fixed buttons
+            switch (btn) {
             case SDL_CONTROLLER_BUTTON_DPAD_UP: {
                 float sens = projectm_get_beat_sensitivity(g_pm);
                 sens = (sens < 4.9f) ? sens + 0.2f : 5.0f;
-                projectm_set_beat_sensitivity(g_pm, sens);
+                setBeatSensitivity(sens, "key");
                 fprintf(stderr, "[Vibeus] Beat sensitivity: %.1f\n", sens);
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Beat sensitivity %.1f", sens);
+                toastInput(buf, 0.7f);
                 break;
             }
             case SDL_CONTROLLER_BUTTON_DPAD_DOWN: {
                 float sens = projectm_get_beat_sensitivity(g_pm);
                 sens = (sens > 0.2f) ? sens - 0.2f : 0.0f;
-                projectm_set_beat_sensitivity(g_pm, sens);
+                setBeatSensitivity(sens, "key");
                 fprintf(stderr, "[Vibeus] Beat sensitivity: %.1f\n", sens);
+                char buf[64];
+                snprintf(buf, sizeof(buf), "Beat sensitivity %.1f", sens);
+                toastInput(buf, 0.7f);
                 break;
             }
-            default: break;
+            default:
+                break;
             }
             continue;
         }
@@ -784,7 +1021,7 @@ static void processEvents()
             break;
 
         case SDL_MOUSEBUTTONDOWN:
-            if (event.button.button == SDL_BUTTON_LEFT) {
+            if (false && g_config.touchEnabled && event.button.button == SDL_BUTTON_LEFT) {  // [DISABLED]
                 g_mouseDown = true;
                 float nx, ny;
                 screenToNormalized(event.button.x, event.button.y, nx, ny);
@@ -795,7 +1032,7 @@ static void processEvents()
                 g_prevMouseX  = event.button.x;
                 g_prevMouseY  = event.button.y;
                 g_prevMouseMs = SDL_GetTicks();
-            } else if (event.button.button == SDL_BUTTON_RIGHT) {
+            } else if (false && g_config.touchEnabled && event.button.button == SDL_BUTTON_RIGHT) {  // [DISABLED]
                 // Cycle touch waveform type
                 g_touchTypeIndex = (g_touchTypeIndex + 1) % g_touchTypeCount;
                 fprintf(stderr, "[Vibeus] Touch type: %s\n", touchTypeName(g_touchTypes[g_touchTypeIndex]));
@@ -803,7 +1040,7 @@ static void processEvents()
             break;
 
         case SDL_MOUSEMOTION:
-            if (g_mouseDown) {
+            if (false && g_config.touchEnabled && g_mouseDown) {  // [DISABLED]
                 float nx, ny;
                 screenToNormalized(event.motion.x, event.motion.y, nx, ny);
                 projectm_touch_drag(g_pm, nx, ny, g_touchPressure);
@@ -820,19 +1057,21 @@ static void processEvents()
             break;
 
         case SDL_MOUSEWHEEL:
-            if (SDL_GetModState() & KMOD_SHIFT) {
+            if (false && g_config.touchEnabled && (SDL_GetModState() & KMOD_SHIFT)) {  // [DISABLED]
                 // Shift+scroll = cycle touch type
                 if (event.wheel.y > 0)
                     g_touchTypeIndex = (g_touchTypeIndex + 1) % g_touchTypeCount;
                 else if (event.wheel.y < 0)
                     g_touchTypeIndex = (g_touchTypeIndex - 1 + g_touchTypeCount) % g_touchTypeCount;
                 fprintf(stderr, "[Vibeus] Touch type: %s\n", touchTypeName(g_touchTypes[g_touchTypeIndex]));
-            } else {
+            } else if (false) {  // [DISABLED]
                 // Scroll = adjust touch pressure (0–2)
+                int prevPressure = g_touchPressure;
                 g_touchPressure += (event.wheel.y > 0) ? 1 : -1;
                 if (g_touchPressure < 0) g_touchPressure = 0;
                 if (g_touchPressure > 2) g_touchPressure = 2;
-                fprintf(stderr, "[Vibeus] Touch pressure: %d\n", g_touchPressure);
+                if (g_touchPressure != prevPressure)
+                    fprintf(stderr, "[Vibeus] Touch pressure: %d\n", g_touchPressure);
             }
             break;
 
@@ -853,12 +1092,50 @@ static void processEvents()
 
 // ----- Apply Configuration -----
 
+// ----- Centralized Beat Sensitivity Setter (Phase 1 Governance) -----
+// This is the ONLY function allowed to call projectm_set_beat_sensitivity()
+// outside of the storyteller's internal update loop.
+// All other call sites (init, applyConfig, stasis, safety clamps) must
+// go through this helper so we have a single audit log.
+static void setBeatSensitivity(float value, const char* reason)
+{
+    if (!g_pm) return;
+
+    // Hard safety clamp (never allow runaway > 3.0). Stasis is the only path
+    // allowed to force exact zero so silence can truly suppress beat reactivity.
+    const bool stasisReason = reason && std::strcmp(reason, "stasis") == 0;
+    const float minValue = stasisReason ? 0.0f : 0.1f;
+    float clamped = (std::max)(minValue, (std::min)(3.0f, value));
+    if (clamped != value) {
+        fprintf(stderr, "[Beat] Clamped sensitivity %.2f -> %.2f (%s)\n", value, clamped, reason);
+    }
+
+    projectm_set_beat_sensitivity(g_pm, clamped);
+
+    static float lastLoggedValue = -1.0f;
+    static std::string lastLoggedReason;
+    const std::string currentReason = reason ? reason : "unknown";
+    if (g_config.storyDebug &&
+        (clamped != lastLoggedValue || currentReason != lastLoggedReason)) {
+        fprintf(stderr, "[Beat] setBeatSensitivity(%.2f) reason=%s\n", clamped, currentReason.c_str());
+        lastLoggedValue = clamped;
+        lastLoggedReason = currentReason;
+    }
+}
+
 static void applyConfig(const VibeusConfig& cfg)
 {
+    // Phase 1 Hardening: Single source of truth for all settings
+    // All projectM + SDL side-effects for mesh, aspect, perfMode, easterEgg, etc.
+    // must go through this function (except storyteller beat sensitivity).
     // Audio
     g_audioGain = cfg.audioGain;
     if (g_pm) {
-        projectm_set_beat_sensitivity(g_pm, cfg.beatSensitivity);
+        // Flash limiter caps beat sensitivity to reduce rapid brightness spikes
+        float effectiveSensitivity = cfg.flashLimiter
+            ? (cfg.beatSensitivity < 1.5f ? cfg.beatSensitivity : 1.5f)
+            : cfg.beatSensitivity;
+        setBeatSensitivity(effectiveSensitivity, "applyConfig");
 
         // Presets
         projectm_set_preset_duration(g_pm, cfg.presetDuration);
@@ -866,7 +1143,23 @@ static void applyConfig(const VibeusConfig& cfg)
         projectm_set_hard_cut_enabled(g_pm, cfg.autoAdvance && cfg.hardCutEnabled);
         projectm_set_hard_cut_sensitivity(g_pm, cfg.hardCutSensitivity);
         projectm_set_hard_cut_duration(g_pm, cfg.hardCutDuration);
+        projectm_set_easter_egg(g_pm, cfg.easterEgg);  // Preset variety
+
+        // Visual Quality
+        projectm_set_aspect_correction(g_pm, cfg.aspectCorrection);  // Fix ultrawide stretching
+        
+        // Mesh detail (separate from perfMode for fine control)
+        int meshW = static_cast<int>(cfg.meshDetail);
+        int meshH = meshW * 3 / 4;  // Maintain 4:3 aspect ratio
+        projectm_set_mesh_size(g_pm, meshW, meshH);
+
+        // Lock preset when autoAdvance is off or vibeLock is active
+        projectm_set_preset_locked(g_pm, !cfg.autoAdvance || cfg.vibeLock);
     }
+
+    // Accessibility
+    g_flashLimiter   = cfg.flashLimiter;
+    g_reducedMotion  = cfg.reducedMotion;
 
     // Shuffle
     if (cfg.shuffle != g_presets.isShuffled())
@@ -884,8 +1177,59 @@ static void applyConfig(const VibeusConfig& cfg)
     g_speedMultiplier = cfg.speedMultiplier;
     g_flowMode = cfg.flowMode;
 
+    // Performance Mode - affects VSync. Mesh resolution comes from Mesh Detail.
+    switch (cfg.perfMode) {
+        case PerfMode::BatterySaver:
+            SDL_GL_SetSwapInterval(0);  // No VSync
+            break;
+        case PerfMode::Balanced:
+        case PerfMode::Quality:
+        default:
+            SDL_GL_SetSwapInterval(1);  // VSync on
+            break;
+    }
+
     // UI scale (base 1.35 * user factor)
     ImGui::GetIO().FontGlobalScale = 1.35f * cfg.fontScale;
+}
+
+static std::string normalizePresetPathForCompare(const std::string& path)
+{
+    if (path.empty()) return {};
+
+    try {
+        fs::path p(path);
+        if (fs::exists(p))
+            return fs::weakly_canonical(p).string();
+        return p.lexically_normal().string();
+    } catch (...) {
+        return path;
+    }
+}
+
+static bool findPlaylistPositionByPath(projectm_playlist_handle playlist,
+                                       const std::string& selectedPath,
+                                       uint32_t& outPosition)
+{
+    if (!playlist || selectedPath.empty()) return false;
+
+    const std::string target = normalizePresetPathForCompare(selectedPath);
+    const uint32_t total = g_presets.count();
+
+    for (uint32_t i = 0; i < total; ++i) {
+        char* item = projectm_playlist_item(playlist, i);
+        if (!item) continue;
+
+        std::string itemPath(item);
+        projectm_playlist_free_string(item);
+
+        if (itemPath == selectedPath || normalizePresetPathForCompare(itemPath) == target) {
+            outPosition = i;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 // ----- Handle Menu Actions -----
@@ -913,19 +1257,42 @@ static void handleMenuAction(MenuAction action)
 
     case MenuAction::BrowsePresets:
         g_menu.loadPresetList(g_presets.handle());
-        // Try to load favorites
+        g_menu.setPresetDatabase(&g_presetDb);   // enable category browsing
+
+        // Sync favorites from config.json into the UI (path-based persistence)
         {
-            auto exePath = fs::path(SDL_GetBasePath());
-            std::string favPath = (exePath / "favorites.txt").string();
-            g_menu.loadFavorites(favPath);
+            g_menu.loadFavorites(g_favoritesPath); // legacy .txt support
+
+            // New: populate m_favorites from favoritePresetPaths in config (simple O(n) scan)
+            for (const auto& path : g_config.favoritePresetPaths) {
+                // Scan a safe range; PresetDatabase internally knows its size
+                for (uint32_t i = 0; i < 20000; ++i) {
+                    const ::PresetEntry* pe = g_presetDb.getPreset(i);
+                    if (!pe) break; // end of list
+                    if (pe->fullPath == path) {
+                        g_menu.toggleFavorite(i);
+                        break;
+                    }
+                }
+            }
         }
         g_menu.showScreen(UIScreen::PresetBrowser);
         break;
 
     case MenuAction::PlayPreset: {
-        uint32_t idx = g_menu.selectedPresetIndex();
-        projectm_playlist_set_position(g_presets.handle(), idx, true);
-        fprintf(stderr, "[Vibeus] Playing preset #%u\n", idx);
+        const std::string selectedPath = g_menu.selectedPresetPath();
+        uint32_t playlistPos = 0;
+
+        if (!findPlaylistPositionByPath(g_presets.handle(), selectedPath, playlistPos)) {
+            fprintf(stderr,
+                    "[PresetBrowser] WARNING: Could not reconcile selected preset path to live playlist: %s\n",
+                    selectedPath.empty() ? "<empty>" : selectedPath.c_str());
+            g_menu.showToast("Preset unavailable (filtered or quarantined)", 3.0f);
+            break;
+        }
+
+        projectm_playlist_set_position(g_presets.handle(), playlistPos, true);
+        fprintf(stderr, "[Vibeus] Playing preset #%u via path: %s\n", playlistPos, selectedPath.c_str());
         // If we were in main menu, start the visualizer
         if (g_appState == AppState::MainMenu) {
             g_appState = AppState::Visualizer;
@@ -944,11 +1311,19 @@ static void handleMenuAction(MenuAction action)
     case MenuAction::BackToPause:
         // Save favorites before leaving browser
         {
-            auto exePath = fs::path(SDL_GetBasePath());
-            std::string favPath = (exePath / "favorites.txt").string();
-            g_menu.saveFavorites(favPath);
+            g_menu.saveFavorites(g_favoritesPath);
         }
         g_menu.showScreen(UIScreen::PauseMenu);
+        break;
+
+    case MenuAction::ShowControls:
+        // Open Settings and jump directly to the Controls tab (index 4)
+        if (g_appState == AppState::Visualizer && g_paused)
+            g_menu.setSettingsReturnScreen(UIScreen::PauseMenu);
+        else
+            g_menu.setSettingsReturnScreen(UIScreen::MainMenu);
+        g_menu.jumpToSettingsTab(4);
+        g_menu.showScreen(UIScreen::Settings);
         break;
 
     case MenuAction::Settings:
@@ -967,9 +1342,7 @@ static void handleMenuAction(MenuAction action)
     case MenuAction::ExitToDesktop:
         // Save favorites on exit
         {
-            auto exePath = fs::path(SDL_GetBasePath());
-            std::string favPath = (exePath / "favorites.txt").string();
-            g_menu.saveFavorites(favPath);
+            g_menu.saveFavorites(g_favoritesPath);
         }
         saveConfig(g_config, g_configPath);
         g_running = false;
@@ -979,6 +1352,29 @@ static void handleMenuAction(MenuAction action)
         // Apply in real-time (no disk save — that happens on Back)
         applyConfig(g_config);
         g_menu.showToast("Settings applied");
+        break;
+
+    case MenuAction::ApplyTransitionSettings:
+        // Force immediate push of transition / hardcut / storyteller settings
+        applyConfig(g_config);
+        // Also push storyteller settings right now so the new mode takes effect instantly
+        {
+            StorySettings ss{};
+            ss.transitionStyle     = g_config.storyTransitionStyle;
+            ss.dropSensitivity     = g_config.storyDropSensitivity;
+            ss.bassReactivity      = g_config.storyBassReactivity;
+            ss.sustainMaxSec       = g_config.storySustainMax;
+            ss.buildupLockPreset   = g_config.storyBuildupLock;
+            ss.chillGateSeconds    = g_config.storyChillGateSec;
+            ss.buildupMinSeconds   = g_config.storyBuildupMinSec;
+            ss.buildupRatioGate    = g_config.storyBuildupRatio;
+            ss.buildupFluxGate     = g_config.storyBuildupFlux;
+            ss.dropRatioGate       = g_config.storyDropRatio;
+            ss.dropBassGate        = g_config.storyDropBass;
+            ss.dropFluxGate        = g_config.storyDropFlux;
+            g_storyteller.applySettings(ss);
+        }
+        g_menu.showToast("Transition settings applied");
         break;
 
     case MenuAction::BackFromSettings:
@@ -1002,9 +1398,7 @@ static void handleMenuAction(MenuAction action)
     // Also save favorites when returning to main menu from browser
     if (action == MenuAction::BackToMenu &&
         g_menu.currentScreen() == UIScreen::MainMenu) {
-        auto exePath = fs::path(SDL_GetBasePath());
-        std::string favPath = (exePath / "favorites.txt").string();
-        g_menu.saveFavorites(favPath);
+        g_menu.saveFavorites(g_favoritesPath);
     }
 }
 
@@ -1023,10 +1417,32 @@ int main(int argc, char* argv[])
         attachConsole();
 #endif
 
-    fprintf(stderr, "=== Vibeus v0.2.0 ===\n");
+    // Resolve per-user writable paths as early as possible so installed-build crashes are diagnosable.
+    g_userDataDir = getUserDataDir();
+    g_configPath = (fs::path(g_userDataDir) / "vibeus_config.json").string();
+    g_favoritesPath = (fs::path(g_userDataDir) / "favorites.txt").string();
+    g_brokenPresetBlacklistPath = (fs::path(g_userDataDir) / "broken_presets.txt").string();
+    g_userBlacklistPath = (fs::path(g_userDataDir) / "blacklisted_presets.txt").string();
+
+    // If running without a debug console (typical installed build), write logs to a user-writable file.
+    if (!g_debug) {
+        std::string logPath = (fs::path(g_userDataDir) / "vibeus_debug.log").string();
+        FILE* dummy;
+        freopen_s(&dummy, logPath.c_str(), "a", stderr);
+        freopen_s(&dummy, logPath.c_str(), "a", stdout);
+        setvbuf(stderr, nullptr, _IONBF, 0);
+        setvbuf(stdout, nullptr, _IONBF, 0);
+    }
+
+    fprintf(stderr, "=== Vibeus v0.2.3-dev ===\n");
     if (g_debug)
         fprintf(stderr, "[DEBUG MODE ENABLED]\n");
-    fprintf(stderr, "\n");
+    fprintf(stderr, "[Vibeus] User data dir: %s\n\n", g_userDataDir.c_str());
+
+    // Load user configuration early (safe: per-user AppData path)
+    g_config = loadConfig(g_configPath);
+    if (!fs::exists(g_configPath))
+        saveConfig(g_config, g_configPath);
 
     // 1. Initialize SDL + OpenGL
     if (!initSDL()) return 1;
@@ -1058,9 +1474,45 @@ int main(int argc, char* argv[])
     fprintf(stderr, "[Vibeus] Presets directory: %s\n", presetsDir.c_str());
     g_presets.init(g_pm, presetsDir);
 
+    // 8. Apply blacklists (fast)
+    g_presets.applyBlacklist(g_brokenPresetBlacklistPath);
+    g_presets.applyBlacklist(g_userBlacklistPath);
+
     fprintf(stderr, "\n[Vibeus] Ready! %u presets loaded. Shuffle: %s\n",
             g_presets.count(), g_presets.isShuffled() ? "ON" : "OFF");
-    fprintf(stderr, "[Vibeus] Controls:\n");
+
+    // Initialize storyteller
+    g_storyteller.init(g_pm, &g_presets);
+
+    // 9. Validate and filter broken presets (if enabled)
+    if (g_config.validatePresetsOnStartup) {
+        fprintf(stderr, "\n[Vibeus] Validating presets for shader errors...\n");
+        fprintf(stderr, "[Vibeus] This may take a few minutes on first run.\n");
+        fprintf(stderr, "[Vibeus] Press ESC to skip validation.\n");
+        try {
+            const std::string validationLogPath = (fs::path(g_userDataDir) / "preset_validation.log").string();
+            bool validationSkipped = false;
+            uint32_t removed = g_presets.validateAndFilter(g_userDataDir,
+                                                           g_brokenPresetBlacklistPath,
+                                                           validationLogPath,
+                                                           &validationSkipped);
+            if (validationSkipped) {
+                fprintf(stderr, "[Vibeus] Preset validation skipped by user.\n");
+                fprintf(stderr, "[Vibeus] Validation log: %s\n", validationLogPath.c_str());
+            } else if (removed > 0) {
+                fprintf(stderr, "\n[Vibeus] Removed %u broken presets (blacklist: %s)\n", removed, g_brokenPresetBlacklistPath.c_str());
+                fprintf(stderr, "[Vibeus] Final count: %u working presets\n", g_presets.count());
+                fprintf(stderr, "[Vibeus] Validation log: %s\n", validationLogPath.c_str());
+            } else {
+                fprintf(stderr, "[Vibeus] All presets validated successfully!\n");
+                fprintf(stderr, "[Vibeus] Validation log: %s\n", validationLogPath.c_str());
+            }
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[Vibeus] WARNING: Preset validation failed: %s\n", e.what());
+        }
+    }
+
+    fprintf(stderr, "\n[Vibeus] Controls:\n");
     fprintf(stderr, "  N/Right=next  P/Left=prev  R=random  H=history  S=shuffle\n");
     fprintf(stderr, "  F/F11=fullscreen  D=debug  Up/Down=beat sensitivity\n");
     fprintf(stderr, "  [/]=speed down/up  Backspace=reset speed\n");
@@ -1070,15 +1522,12 @@ int main(int argc, char* argv[])
     fprintf(stderr, "  Tab=flow mode  Esc=pause menu  Q=quit\n");
     fprintf(stderr, "  Gamepad: A=next B=prev X=random Y=shuffle Start=pause\n\n");
 
-    // 6. Initialize menu overlay
+    // 8. Initialize menu overlay
     if (!g_menu.init(g_window, g_glCtx)) {
         fprintf(stderr, "[Vibeus] WARNING: Menu overlay init failed\n");
     }
-
-    // 7. Load user configuration
-    g_configPath = (fs::path(SDL_GetBasePath()) / "vibeus_config.json").string();
-    g_config = loadConfig(g_configPath);
     g_menu.setConfigPtr(&g_config);
+    g_menu.setUserDataDir(g_userDataDir);
 
     // Apply saved config to all systems (except fullscreen on startup — handled by config value)
     {
@@ -1091,9 +1540,8 @@ int main(int argc, char* argv[])
         if (savedFullscreen && !g_fullscreen)
             toggleFullscreen();
     }
-    fprintf(stderr, "[Vibeus] Config loaded from %s\n", g_configPath.c_str());
 
-    // 8. Try to open gamepad
+    // 9. Try to open gamepad
     tryOpenGamepad();
 
     // 9. Start with epilepsy splash screen
@@ -1110,6 +1558,15 @@ int main(int argc, char* argv[])
 
         // Process input
         processEvents();
+
+        // Reset GL state before projectM renders (ImGui may leave dirty state)
+        static auto pfnBindFramebuffer = reinterpret_cast<void(APIENTRY*)(GLenum, GLuint)>(
+            SDL_GL_GetProcAddress("glBindFramebuffer"));
+        if (pfnBindFramebuffer)
+            pfnBindFramebuffer(0x8D40 /*GL_FRAMEBUFFER*/, 0);
+        glDisable(GL_SCISSOR_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
         // State-specific rendering
         switch (g_appState) {
@@ -1133,16 +1590,165 @@ int main(int argc, char* argv[])
             if (!g_paused || settingsLive) {
                 // Process analog gamepad input
                 processGamepad();
-                // Process flow mode (mouse-driven manipulation)
-                processFlowMode();
-                // Process expanding ripple rings
-                processRipples();
-                // Update virtual time for speed control
-                updateVirtualTime(SDL_GetTicks());
+                // Process flow mode (mouse-driven manipulation) [DISABLED]
+                // processFlowMode();
+                // Process expanding ripple rings [DISABLED]
+                // processRipples();
+                // Update virtual time after stasis detection below. In stasis we
+                // deliberately hold frame time steady so silence feels frozen.
+
+                // ── Stasis detection (freeze when no audio) ──
+                static float silenceTimer = 0.0f;
+                // g_inStasis is the global used by Live Status header
+                const float rms = g_audio.levelRms();
+                const float deltaTime = 1.0f / (g_currentFps > 10.0f ? g_currentFps : 60.0f);
+
+                if (g_config.stasisEnabled) {
+                    if (rms < g_config.stasisThreshold) {
+                        silenceTimer += deltaTime;
+                        if (silenceTimer >= g_config.stasisFadeTime && !g_inStasis) {
+                            g_inStasis = true;
+                            fprintf(stderr,
+                                    "[Stasis] Entered silence freeze (rms=%.4f threshold=%.4f delay=%.2fs)\n",
+                                    rms, g_config.stasisThreshold, g_config.stasisFadeTime);
+                        }
+                    } else {
+                        if (g_inStasis) {
+                            // Waking up from stasis
+                            fprintf(stderr,
+                                    "[Stasis] Exited silence freeze (rms=%.4f threshold=%.4f)\n",
+                                    rms, g_config.stasisThreshold);
+                            silenceTimer = 0.0f;
+                            g_inStasis = false;
+                        }
+                        silenceTimer = 0.0f;
+                    }
+                } else {
+                    if (g_inStasis) {
+                        fprintf(stderr, "[Stasis] Disabled while active — exiting silence freeze\n");
+                    }
+                    silenceTimer = 0.0f;
+                    g_inStasis = false;
+                }
+
+                // Hold visual time steady in stasis; otherwise advance according to
+                // speed/reduced-motion controls. Keep g_lastFrameTicks fresh while
+                // frozen so exiting stasis does not accumulate a huge delta.
+                if (g_inStasis) {
+                    g_lastFrameTicks = SDL_GetTicks();
+                    projectm_set_frame_time(g_pm, g_virtualTime);
+                } else {
+                    updateVirtualTime(SDL_GetTicks());
+                }
+
+                // Storyteller analysis (if enabled and not in stasis)
+                if (g_config.storytellingEnabled && !g_inStasis) {
+                    // Push tunable settings from config → storyteller each frame
+                    StorySettings ss;
+                    ss.dropSensitivity   = g_config.storyDropSensitivity;
+                    ss.bassReactivity    = g_config.storyBassReactivity;
+                    ss.sustainMaxSec     = g_config.storySustainMax;
+                    ss.transitionStyle   = g_config.storyTransitionStyle;
+                    ss.buildupLockPreset = g_config.storyBuildupLock;
+                    ss.debugMode         = g_config.storyDebug;
+                    ss.chillGateSeconds  = g_config.storyChillGateSec;
+                    ss.buildupMinSeconds = g_config.storyBuildupMinSec;
+                    ss.buildupRatioGate  = g_config.storyBuildupRatio;
+                    ss.buildupFluxGate   = g_config.storyBuildupFlux;
+                    ss.dropRatioGate     = g_config.storyDropRatio;
+                    ss.dropBassGate      = g_config.storyDropBass;
+                    ss.dropFluxGate      = g_config.storyDropFlux;
+                    ss.beatReactivity    = g_config.beatReactivity;
+                    g_storyteller.applySettings(ss);
+
+                    g_storyteller.update(g_audio.levelPeak(),
+                                         g_audio.levelBass(),
+                                         g_audio.levelBeatBass(),
+                                         g_audio.levelBeatMid(),
+                                         g_audio.levelBeatHigh(),
+                                         deltaTime);
+                } else if (g_inStasis) {
+                    // In stasis: freeze storyteller and kill beat reactivity
+                    setBeatSensitivity(0.0f, "stasis");
+                }
+
+                // Safety clamp — prevents any accidental runaway sensitivity
+                // (this was the cause of "gets insanely fast after a while")
+                float currentSens = projectm_get_beat_sensitivity(g_pm);
+                if (currentSens > 3.0f) {
+                    // Aggressive reset — something escaped the storyteller clamps
+                    setBeatSensitivity(2.0f, "safety-reset");
+                    fprintf(stderr, "[Safety] Runaway sensitivity detected (%.1f) — reset to 2.0\n", currentSens);
+                }
+
                 // Capture audio and feed to projectM (with gain applied)
-                g_audio.feedAudio(g_pm, g_audioGain);
+                // Flash limiter caps gain to 1.0 to reduce rapid brightness spikes
+                float effectiveGain = (g_flashLimiter && g_audioGain > 1.0f) ? 1.0f : g_audioGain;
+                g_audio.feedAudio(g_pm, effectiveGain);
+
+                // Beat reactivity control: if user disabled adaptive beat, force fixed sensitivity.
+                // The storyteller is now the single source of truth for dynamic sensitivity.
+                // (We removed the per-frame reactivity multiplier because it was causing
+                // unbounded compounding → "visuals go 100000x fast" after a few minutes.)
+                if (!g_inStasis && !g_config.adaptiveBeat) {
+                    float fixedSens = g_config.beatSensitivity;
+                    setBeatSensitivity(fixedSens, "non-adaptive");
+                }
                 // Render visualization frame
                 projectm_opengl_render_frame(g_pm);
+
+                // Beat detection: use band-limited kick energy + flux with adaptive floor
+                const float bassEnergy = g_audio.levelBeatBass(); // <150Hz kick band
+                const float rmsEnergy  = g_audio.levelRms();
+
+                static float bassAvg = 0.0f;     // slow-moving floor
+                static float fluxAvg = 0.0f;     // onset sensitivity
+                static float prevBass = 0.0f;
+                static int   beatCooldown = 0;   // frame countdown to avoid rapid re-triggers
+
+                if (beatCooldown > 0)
+                    beatCooldown--;
+
+                // Apply user-configurable beat hold time (hysteresis)
+                static int lastHoldFrames = 0;
+                int targetHoldFrames = static_cast<int>(g_config.beatHoldTime * (g_currentFps > 10.0f ? g_currentFps : 60.0f));
+                if (targetHoldFrames != lastHoldFrames) {
+                    lastHoldFrames = targetHoldFrames;
+                }
+
+                float flux = (std::max)(0.0f, bassEnergy - prevBass);
+                prevBass = bassEnergy;
+
+                // Update adaptive baselines (decays quickly on quiet passages)
+                bassAvg = bassAvg * 0.96f + bassEnergy * 0.04f;
+                fluxAvg = fluxAvg * 0.90f + flux * 0.10f;
+
+                const float dynamicFloor     = (std::max)(0.01f, bassAvg * 0.8f + rmsEnergy * 0.05f);
+                const float fluxGate         = 0.0015f + fluxAvg * 0.20f;                // lenient gate
+                const float strongFluxGate   = fluxAvg * 1.6f + 0.010f;                  // high-transient catch
+                const float dynamicThreshold = dynamicFloor * 1.15f + fluxAvg * 0.65f + 0.010f;
+
+                const bool fluxHit     = (flux >= fluxGate);
+                const bool fluxStrong  = (flux >= strongFluxGate);                       // sneaky drop path
+                const bool bassHit     = (bassEnergy >= dynamicThreshold);
+                const bool bassJump    = (bassEnergy >= dynamicFloor * 2.0f);            // guard loud choruses
+                const bool fluxOnlyHit = fluxStrong && (bassEnergy >= dynamicFloor * 0.8f);
+
+                if (beatCooldown == 0 && ( (bassHit && fluxHit) || bassJump || fluxOnlyHit )) {
+                    g_beatIndicatorAlpha = 1.0f;
+
+                    // Use user-configurable hold time (hysteresis) instead of hardcoded 180ms
+                    float holdSec = (g_config.beatHoldTime > 0.01f) ? g_config.beatHoldTime : 0.18f;
+                    beatCooldown = static_cast<int>((g_currentFps > 10.0f ? g_currentFps : 60.0f) * holdSec);
+                    if (beatCooldown < 6) beatCooldown = 6;
+                }
+
+                // Fade out indicator
+                if (g_beatIndicatorAlpha > 0.0f) {
+                    float deltaTime = 1.0f / (g_currentFps > 0.0f ? g_currentFps : 60.0f);
+                    g_beatIndicatorAlpha -= deltaTime * 4.0f;
+                    if (g_beatIndicatorAlpha < 0.0f) g_beatIndicatorAlpha = 0.0f;
+                }
             } else {
                 // While paused, render a few frozen frames then stop
                 if (g_pauseRenderCount < 3) {
@@ -1157,9 +1763,29 @@ int main(int argc, char* argv[])
 
         // Render UI overlay if visible (draws on top of everything)
         if (g_menu.isVisible()) {
+            // Push live storyteller + preset status to the menu for the "Live Status" header
+            const char* stateStr = (g_storyteller.currentState() == StoryState::Chill)   ? "CHILL" :
+                                   (g_storyteller.currentState() == StoryState::Buildup) ? "BUILD" :
+                                   (g_storyteller.currentState() == StoryState::Drop)    ? "DROP"  : "SUSTAIN";
+            std::string presetName = g_presets.currentPresetName();
+            g_menu.setLiveStatus(presetName, stateStr, g_storyteller.lastBeatSensitivity(), g_inStasis);
+
             MenuAction action = g_menu.render();
             if (action != MenuAction::None)
                 handleMenuAction(action);
+        }
+
+        // Render custom beat indicator if active
+        if (g_appState == AppState::Visualizer && g_showBeatIndicator && g_beatIndicatorAlpha > 0.0f) {
+            g_menu.renderBeatIndicator(g_beatIndicatorAlpha);
+        }
+
+        // Storyteller HUD overlay (state + ratio/flux)
+        if (g_appState == AppState::Visualizer && g_config.storytellingEnabled && g_config.storyDebug) {
+            const char* s = (g_storyteller.currentState() == StoryState::Chill)   ? "CHILL" :
+                            (g_storyteller.currentState() == StoryState::Buildup) ? "BUILD" :
+                            (g_storyteller.currentState() == StoryState::Drop)    ? "DROP"  : "SUSTAIN";
+            g_menu.renderStoryOverlay(s, g_storyteller.lastEnergyRatio(), g_storyteller.spectralFlux());
         }
 
         // Always render toasts (even when menu is hidden)
@@ -1187,6 +1813,11 @@ int main(int argc, char* argv[])
 
     // 11. Cleanup
     fprintf(stderr, "\n[Vibeus] Shutting down...\n");
+
+    // Persist user data on ANY exit path (window close, Q key, etc.)
+    g_menu.saveFavorites(g_favoritesPath);
+    saveConfig(g_config, g_configPath);
+
     g_menu.shutdown();
     g_audio.shutdown();
     if (g_gamepad) {
