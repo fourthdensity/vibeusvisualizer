@@ -85,7 +85,7 @@ public:
     void setConfigPtr(VibeusConfig* cfg) { m_config = cfg; }
     void setUserDataDir(const std::string& path) { m_userDataDir = path; }
 
-    // Settings: jump to a specific tab by index (0=Audio&Beat, 1=Presets, 2=Visuals, 3=Advanced, 4=Controls)
+    // Settings: jump to a specific tab by index (0=Audio&Beat, 1=Presets, 2=Display&Quality, 3=Advanced, 4=Controls, 5=About)
     void jumpToSettingsTab(int tabIndex) { m_settingsTabTarget = tabIndex; }
 
     // Live status for the settings panel (called every frame from main)

@@ -2,6 +2,8 @@
 
 A real-time music visualizer that reacts to whatever audio is playing on your system. Powered by the [projectM](https://github.com/projectM-visualizer/projectm) rendering engine and thousands of community-created visual presets.
 
+> **Project layout note (post-move):** Core sources, assets, and installer are in the `Vibeus/` subdirectory. Build using the root `CMakeLists.txt` (dependencies resolved via vcpkg + external projectM). See `BUILD_READY.md` for details.
+
 ## Features
 
 - **Live audio capture** — WASAPI loopback grabs system audio (no microphone needed)

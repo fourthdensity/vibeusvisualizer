@@ -43,27 +43,62 @@ bool PresetManager::init(projectm_handle pm, const std::string& presetPath)
     }
 
     projectm_playlist_set_shuffle(m_playlist, m_shuffle);
-    projectm_playlist_play_next(m_playlist, true); // start first preset
 
     return true;
 }
 
 void PresetManager::next(bool hardCut)
 {
-    if (m_playlist)
-        projectm_playlist_play_next(m_playlist, hardCut);
+    if (!m_playlist)
+        return;
+
+    if (m_shuffle) {
+        playRandom(hardCut);
+        return;
+    }
+
+    uint32_t total = count();
+    if (total == 0)
+        return;
+
+    uint32_t nextPos = (position() + 1) % total;
+    playPosition(nextPos, hardCut, "Next");
 }
 
 void PresetManager::previous(bool hardCut)
 {
-    if (m_playlist)
-        projectm_playlist_play_previous(m_playlist, hardCut);
+    if (!m_playlist)
+        return;
+
+    uint32_t total = count();
+    if (total == 0)
+        return;
+
+    uint32_t pos = position();
+    uint32_t prevPos = (pos == 0) ? (total - 1) : (pos - 1);
+    playPosition(prevPos, hardCut, "Previous");
 }
 
 void PresetManager::last(bool hardCut)
 {
     if (m_playlist)
         projectm_playlist_play_last(m_playlist, hardCut);
+}
+
+bool PresetManager::playRandom(bool hardCut)
+{
+    if (!m_playlist)
+        return false;
+
+    uint32_t total = projectm_playlist_size(m_playlist);
+    if (total == 0)
+        return false;
+
+    uint32_t pos = 0;
+    if (!chooseRandomPosition(pos))
+        return false;
+
+    return playPosition(pos, hardCut, "Random");
 }
 
 void PresetManager::toggleShuffle()
@@ -180,7 +215,123 @@ uint32_t PresetManager::applyBlacklist(const std::string& blacklistPath)
     if (removed > 0)
         fprintf(stderr, "[PresetManager] Applied blacklist: removed %u presets\n", removed);
 
+    if (removed > 0) {
+        m_recentPositions.clear();
+        m_recentPresetPaths.clear();
+    }
+
     return removed;
+}
+
+bool PresetManager::playPosition(uint32_t pos, bool hardCut, const char* reason)
+{
+    if (!m_playlist)
+        return false;
+
+    uint32_t total = count();
+    if (total == 0 || pos >= total)
+        return false;
+
+    projectm_playlist_set_position(m_playlist, pos, hardCut);
+
+    std::string presetPath = presetPathAt(pos);
+    rememberPosition(pos, presetPath);
+
+    if (!presetPath.empty()) {
+        fprintf(stderr, "[PresetManager] %s preset %u/%u: %s\n",
+                reason ? reason : "Play", pos + 1, total, presetPath.c_str());
+    } else {
+        fprintf(stderr, "[PresetManager] %s preset %u/%u\n",
+                reason ? reason : "Play", pos + 1, total);
+    }
+
+    return true;
+}
+
+bool PresetManager::chooseRandomPosition(uint32_t& pos)
+{
+    uint32_t total = count();
+    if (total == 0)
+        return false;
+
+    if (total == 1) {
+        pos = 0;
+        return true;
+    }
+
+    uint32_t current = position();
+    std::string currentPath = presetPathAt(current);
+    size_t recentLimit = std::min<size_t>(m_recentPositions.size(), std::min<uint32_t>(total - 1, 48));
+
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        std::uniform_int_distribution<uint32_t> dist(0, total - 1);
+        uint32_t candidate = dist(m_rng);
+        if (candidate == current)
+            continue;
+
+        std::string candidatePath = presetPathAt(candidate);
+        if (!currentPath.empty() && candidatePath == currentPath)
+            continue;
+
+        bool recentlySeen = false;
+        size_t checked = 0;
+        for (auto it = m_recentPositions.rbegin(); it != m_recentPositions.rend() && checked < recentLimit; ++it, ++checked) {
+            if (*it == candidate) {
+                recentlySeen = true;
+                break;
+            }
+        }
+
+        if (!candidatePath.empty()) {
+            checked = 0;
+            for (auto it = m_recentPresetPaths.rbegin(); it != m_recentPresetPaths.rend() && checked < recentLimit; ++it, ++checked) {
+                if (*it == candidatePath) {
+                    recentlySeen = true;
+                    break;
+                }
+            }
+        }
+
+        if (!recentlySeen) {
+            pos = candidate;
+            return true;
+        }
+    }
+
+    // Dense recent history fallback: still guarantee not-current.
+    std::uniform_int_distribution<uint32_t> dist(0, total - 2);
+    uint32_t candidate = dist(m_rng);
+    if (candidate >= current)
+        candidate++;
+    pos = candidate;
+    return true;
+}
+
+void PresetManager::rememberPosition(uint32_t pos, const std::string& presetPath)
+{
+    m_recentPositions.push_back(pos);
+    while (m_recentPositions.size() > 96)
+        m_recentPositions.pop_front();
+
+    if (!presetPath.empty()) {
+        m_recentPresetPaths.push_back(presetPath);
+        while (m_recentPresetPaths.size() > 96)
+            m_recentPresetPaths.pop_front();
+    }
+}
+
+std::string PresetManager::presetPathAt(uint32_t pos) const
+{
+    if (!m_playlist || pos >= projectm_playlist_size(m_playlist))
+        return {};
+
+    char* name = projectm_playlist_item(m_playlist, pos);
+    if (!name)
+        return {};
+
+    std::string result(name);
+    projectm_playlist_free_string(name);
+    return result;
 }
 
 uint32_t PresetManager::validateAndFilter(const std::string& userDataDir,

@@ -27,6 +27,8 @@ struct VibeusConfig {
     bool  hardCutEnabled    = false;    // beat-triggered instant transitions
     float hardCutSensitivity= 2.0f;    // 0.5 – 4.0 (lower = more frequent)
     float hardCutDuration   = 20.0f;   // min seconds before hard cut allowed
+    bool  transitionCompositorEnabled = true; // Vibeus-owned post-processing pulses
+    float transitionCrossfadeDuration = 0.75f; // 0.5 - 1.2 seconds, cinematic post-FX opacity blend
     float easterEgg         = 0.5f;     // 0.0 – 1.0 (preset variety/randomness)
 
     // ── Display ──
@@ -58,7 +60,7 @@ struct VibeusConfig {
     float storyDropSensitivity = 2.0f;  // 1.0 – 4.0 (lower = drops trigger more easily)
     float storyBassReactivity  = 1.0f;  // 0.2 – 3.0 (how much bass/kicks influence detection)
     float storySustainMax      = 12.0f; // 4.0 – 30.0 (max seconds to hold Sustain before returning to Chill)
-    int   storyTransitionStyle = 0;     // 0=Cycling, 1=Flash Cut, 2=Slow Morph, 3=Quick Blend
+    int   storyTransitionStyle = 0;     // 0=Cycling, 1..18=explicit drop transition profiles
     bool  storyBuildupLock     = true;  // Lock preset during buildup (prevents jarring mid-buildup switches)
     bool  storyDebug           = false; // Verbose per-frame storyteller telemetry
     bool  storyDebugRescue     = true;  // Auto-skip broken presets detected at runtime

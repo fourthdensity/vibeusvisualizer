@@ -9,6 +9,89 @@
 #include <cstring>
 #include <cmath>
 
+namespace {
+
+constexpr const char* kTransitionStyles[] = {
+    "Cycling (Auto)",
+    "Flash Cut",
+    "Slow Morph",
+    "Quick Blend",
+    "Glitch Cut",
+    "Zoom Burst",
+    "Energy Flash",
+    "Snap Fade",
+    "Long Dissolve",
+    "Pulse Blend",
+    "Bass Slam",
+    "Breathing Fade",
+    "Clean Slate",
+    "Liquid Drift",
+    "Ambient Wash",
+    "Spark Jump",
+    "Deep Bloom",
+    "Afterimage",
+    "Drop Smash"
+};
+
+constexpr int kTransitionStyleCount = sizeof(kTransitionStyles) / sizeof(kTransitionStyles[0]);
+
+void applyTransitionStyleDefaults(VibeusConfig& cfg)
+{
+    switch (cfg.storyTransitionStyle) {
+    case 0: // Cycling (Auto)
+        cfg.hardCutEnabled = true;
+        cfg.transitionTime = 2.8f;
+        cfg.hardCutSensitivity = 2.0f;
+        break;
+    case 1: // Flash Cut
+    case 7: // Snap Fade
+    case 18: // Drop Smash
+        cfg.hardCutEnabled = true;
+        cfg.transitionTime = 0.3f;
+        cfg.hardCutSensitivity = 1.5f;
+        break;
+    case 2: // Slow Morph
+    case 8: // Long Dissolve
+    case 11: // Breathing Fade
+    case 14: // Ambient Wash
+        cfg.hardCutEnabled = false;
+        cfg.transitionTime = 6.0f;
+        cfg.hardCutSensitivity = 2.8f;
+        break;
+    case 3: // Quick Blend
+    case 9: // Pulse Blend
+    case 15: // Spark Jump
+        cfg.hardCutEnabled = true;
+        cfg.transitionTime = 1.2f;
+        cfg.hardCutSensitivity = 1.9f;
+        break;
+    case 4: // Glitch Cut
+    case 10: // Bass Slam
+    case 12: // Clean Slate
+        cfg.hardCutEnabled = true;
+        cfg.transitionTime = 0.6f;
+        cfg.hardCutSensitivity = 1.4f;
+        break;
+    case 5: // Zoom Burst
+    case 13: // Liquid Drift
+    case 16: // Deep Bloom
+    case 17: // Afterimage
+        cfg.hardCutEnabled = false;
+        cfg.transitionTime = 3.8f;
+        cfg.hardCutSensitivity = 2.2f;
+        break;
+    case 6: // Energy Flash
+        cfg.hardCutEnabled = true;
+        cfg.transitionTime = 0.8f;
+        cfg.hardCutSensitivity = 1.7f;
+        break;
+    default:
+        break;
+    }
+}
+
+} // namespace
+
 // ─── Init / Shutdown ───────────────────────────────────────────────
 
 bool MenuOverlay::init(SDL_Window* window, SDL_GLContext glContext)
@@ -716,37 +799,14 @@ MenuAction MenuOverlay::renderPresetBrowser()
 
         // ── Transition Mode (live control for vibe/flow) ───────────────────
         if (m_config) {
-            const char* transModes[] = {
-                "Smart Storyteller",   // uses storyteller + storyTransitionStyle
-                "Soft Blend",          // long smooth transitions, hard cuts off
-                "Beat Hard Cut",       // instant on strong beats
-                "Vibe Lock"            // stay in current preset family during energy
-            };
             int current = m_config->storyTransitionStyle;
-            // Map storyteller style 0-3 to our 4 modes (simple mapping for now)
-            if (ImGui::Combo("##transMode", &current, transModes, IM_ARRAYSIZE(transModes))) {
-                m_config->storyTransitionStyle = current;
+            if (current < 0 || current >= kTransitionStyleCount)
+                current = 0;
 
-                // Quick mode presets for better "feel"
-                switch (current) {
-                    case 0: // Smart Storyteller
-                        m_config->hardCutEnabled = true;
-                        m_config->transitionTime = 2.8f;
-                        break;
-                    case 1: // Soft Blend
-                        m_config->hardCutEnabled = false;
-                        m_config->transitionTime = 5.5f;
-                        break;
-                    case 2: // Beat Hard Cut
-                        m_config->hardCutEnabled = true;
-                        m_config->transitionTime = 1.2f;
-                        m_config->hardCutSensitivity = 1.8f;
-                        break;
-                    case 3: // Vibe Lock
-                        m_config->hardCutEnabled = false;
-                        m_config->vibeLock = true;
-                        break;
-                }
+            ImGui::SetNextItemWidth(190.0f);
+            if (ImGui::Combo("##transMode", &current, kTransitionStyles, kTransitionStyleCount)) {
+                m_config->storyTransitionStyle = current;
+                applyTransitionStyleDefaults(*m_config);
                 // Note: main loop will pick up the changes via g_config
             }
             ImGui::SameLine();
@@ -1037,6 +1097,52 @@ MenuAction MenuOverlay::renderSettings()
 
             ImGui::Spacing();
 
+            // ── Visual Quality ──
+            ImGui::SeparatorText("Visual Quality");
+            {
+                // Perf Mode
+                const char* perfLabels[] = { "Battery Saver (32×24)", "Balanced (64×48)", "Quality (128×96)" };
+                int perfIdx = static_cast<int>(m_config->perfMode);
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::Combo("Performance Mode", &perfIdx, perfLabels, 3)) {
+                    m_config->perfMode = static_cast<PerfMode>(perfIdx);
+                    changed = true;
+                }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Battery Saver = low mesh, no VSync\nBalanced = good quality + VSync\nQuality = high detail + VSync");
+
+                // Mesh Detail
+                int mesh = static_cast<int>(m_config->meshDetail);
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::SliderInt("Mesh Detail", &mesh, 32, 256, "%d")) {
+                    m_config->meshDetail = static_cast<float>(mesh);
+                    changed = true;
+                }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Higher = smoother curves, more GPU load.\nLower = faster, more angular look.");
+
+                // Aspect Correction
+                if (ImGui::Checkbox("Aspect Ratio Correction", &m_config->aspectCorrection)) {
+                    changed = true;
+                }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Prevents stretching on ultrawide / non-4:3 displays.");
+
+                // Easter Egg (preset variety)
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::SliderFloat("Preset Variety (Easter Egg)", &m_config->easterEgg, 0.0f, 1.0f, "%.2f")) {
+                    changed = true;
+                }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Higher = more random preset selection.\nLower = more predictable cycling.");
+            }
+
+            ImGui::Spacing();
+
             // ── Audio ──
             ImGui::SeparatorText("Audio");
             {
@@ -1076,6 +1182,29 @@ MenuAction MenuOverlay::renderSettings()
                 ImGui::SameLine(); ImGui::TextDisabled("(?)");
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("When ON, the storyteller can raise/lower beat sensitivity\nbased on energy (buildups & drops).\nTurn OFF for consistent fixed sensitivity.");
+
+                if (ImGui::Checkbox("Freeze on Silence##AudioStasis", &m_config->stasisEnabled)) {
+                    changed = true;
+                }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Stasis freezes visual time when the audio signal stays quiet.\nThe Live Status header shows when it is active.");
+
+                if (m_config->stasisEnabled) {
+                    ImGui::SetNextItemWidth(contentW * 0.60f);
+                    if (ImGui::SliderFloat("Silence Threshold##AudioStasis", &m_config->stasisThreshold, 0.001f, 0.050f, "%.3f"))
+                        changed = true;
+                    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("RMS audio level below this value counts as silence.\nRaise it if quiet music should freeze sooner; lower it\nif Vibeus enters stasis too aggressively.");
+
+                    ImGui::SetNextItemWidth(contentW * 0.60f);
+                    if (ImGui::SliderFloat("Stasis Delay##AudioStasis", &m_config->stasisFadeTime, 0.10f, 5.00f, "%.2f sec"))
+                        changed = true;
+                    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("How long audio must stay below the threshold\nbefore Vibeus enters stasis.");
+                }
 
                 // Beat Hold Time (hysteresis / smoothing)
                 ImGui::SetNextItemWidth(contentW * 0.60f);
@@ -1132,15 +1261,6 @@ MenuAction MenuOverlay::renderSettings()
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Max time to stay in the Sustain state\n(holding intensity after a drop) before\nreturning to Chill. Longer = more epic plateaus.");
 
-                    const char* styles[] = {
-                        "Cycling (Auto)",
-                        "Flash Cut",
-                        "Slow Morph",
-                        "Quick Blend",
-                        "Glitch Cut",
-                        "Zoom Burst",
-                        "Energy Flash"
-                    };
                     // Energy Gates (Advanced) - collapsed by default to keep the UI clean
                     if (ImGui::CollapsingHeader("Energy Gates (Advanced)", ImGuiTreeNodeFlags_None)) {
                         ImGui::TextDisabled("Fine-tune how the storyteller detects buildups and drops.");
@@ -1204,13 +1324,29 @@ MenuAction MenuOverlay::renderSettings()
                     }
 
                     ImGui::SetNextItemWidth(contentW * 0.55f);
-                    if (ImGui::Combo("Transition Style", &m_config->storyTransitionStyle, styles, IM_ARRAYSIZE(styles))) {
+                    if (m_config->storyTransitionStyle < 0 || m_config->storyTransitionStyle >= kTransitionStyleCount)
+                        m_config->storyTransitionStyle = 0;
+                    if (ImGui::Combo("Transition Style", &m_config->storyTransitionStyle, kTransitionStyles, kTransitionStyleCount)) {
+                        applyTransitionStyleDefaults(*m_config);
                         m_config->mood = MoodPreset::Custom;
                         changed = true;
                     }
                     ImGui::SameLine(); ImGui::TextDisabled("(?)");
                     if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("How presets change during drops:\n• Cycling = rotates through styles\n• Flash Cut = instant snap\n• Slow Morph = dreamy crossfade\n• Quick Blend = punchy smooth\n• Glitch Cut = fast + glitchy\n• Zoom Burst = long zoom feel\n• Energy Flash = high-energy snap");
+                        ImGui::SetTooltip("How presets change during drops.\nCycling rotates through every effect.\nFast styles use hard or near-hard cuts; slow styles\nuse longer projectM-compatible soft blends.");
+
+                    if (ImGui::Checkbox("Vibeus Post FX Transitions", &m_config->transitionCompositorEnabled))
+                        changed = true;
+                    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Enables the Vibeus-owned post-processing compositor.\nThis adds shader pulses after preset switches without\nmodifying projectM internals.");
+
+                    ImGui::SetNextItemWidth(contentW * 0.60f);
+                    if (ImGui::SliderFloat("Post FX Crossfade", &m_config->transitionCrossfadeDuration, 0.50f, 1.20f, "%.2f s"))
+                        changed = true;
+                    ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Default compositor opacity blend duration.\n750ms is the professional baseline; avoid going below 500ms\nfor major visual-world changes.");
 
                     // Prominent Transition Controls (raw sliders + Apply Now)
                     ImGui::Spacing();
@@ -1408,7 +1544,7 @@ MenuAction MenuOverlay::renderSettings()
         }
 
         // ═══════ DISPLAY TAB ═══════
-        if (ImGui::BeginTabItem("  Visuals  ", nullptr, tabFlagsVisuals)) {
+        if (ImGui::BeginTabItem("  Display & Quality  ", nullptr, tabFlagsVisuals)) {
             m_settingsTab = 2;
 
             ImGui::BeginChild("##displayScroll", ImVec2(0, 0), false);
@@ -1442,6 +1578,38 @@ MenuAction MenuOverlay::renderSettings()
                 ImGui::SameLine(); ImGui::TextDisabled("(?)");
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Glass transparency of this settings panel.\nLower = more see-through, so you can\nwatch the visualizer while tuning.");
+            }
+
+            ImGui::Spacing();
+
+            ImGui::SeparatorText("Render Quality");
+            {
+                const char* perfModes[] = { "Battery Saver", "Balanced", "Quality" };
+                int perfIdx = static_cast<int>(m_config->perfMode);
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::Combo("Performance Mode", &perfIdx, perfModes, 3)) {
+                    m_config->perfMode = static_cast<PerfMode>(perfIdx);
+                    // Keep mesh + perf mode in sync so both settings "work" intuitively.
+                    switch (m_config->perfMode) {
+                        case PerfMode::BatterySaver: m_config->meshDetail = 32.0f;  break;
+                        case PerfMode::Balanced:    m_config->meshDetail = 64.0f;  break;
+                        case PerfMode::Quality:     m_config->meshDetail = 128.0f; break;
+                    }
+                    changed = true;
+                }
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Battery Saver: sets Mesh Detail=32, VSync off\nBalanced: sets Mesh Detail=64, VSync on\nQuality: sets Mesh Detail=128, VSync on\n\nYou can override Mesh Detail after picking a mode.");
+
+                ImGui::SetNextItemWidth(contentW * 0.65f);
+                if (ImGui::SliderFloat("Mesh Detail", &m_config->meshDetail, 32.0f, 128.0f, "%.0f"))
+                    changed = true;
+                ImGui::SameLine(); ImGui::TextDisabled("(?)");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Warp mesh resolution.\nHigher = smoother warps but slower.\nLower = faster but blockier effects.\n\nChanges take effect at the next preset transition\nor on restart.");
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + contentW * 0.92f);
+                ImGui::TextDisabled("Mesh changes take effect at the next preset transition or on restart.");
+                ImGui::PopTextWrapPos();
             }
 
             ImGui::Spacing();
@@ -1503,35 +1671,6 @@ MenuAction MenuOverlay::renderSettings()
             m_settingsTab = 3;
 
             ImGui::BeginChild("##advScroll", ImVec2(0, 0), false);
-
-            ImGui::SeparatorText("Performance");
-            {
-                const char* perfModes[] = { "Battery Saver", "Balanced", "Quality" };
-                int perfIdx = static_cast<int>(m_config->perfMode);
-                ImGui::SetNextItemWidth(contentW * 0.65f);
-                if (ImGui::Combo("Performance Mode", &perfIdx, perfModes, 3)) {
-                    m_config->perfMode = static_cast<PerfMode>(perfIdx);
-                    // Keep mesh + perf mode in sync so both settings "work" intuitively.
-                    switch (m_config->perfMode) {
-                        case PerfMode::BatterySaver: m_config->meshDetail = 32.0f;  break;
-                        case PerfMode::Balanced:    m_config->meshDetail = 64.0f;  break;
-                        case PerfMode::Quality:     m_config->meshDetail = 128.0f; break;
-                    }
-                    changed = true;
-                }
-                ImGui::SameLine(); ImGui::TextDisabled("(?)");
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Battery Saver: sets Mesh Detail=32, VSync off\nBalanced: sets Mesh Detail=64, VSync on\nQuality: sets Mesh Detail=128, VSync on\n\nYou can override Mesh Detail after picking a mode.");
-
-                ImGui::SetNextItemWidth(contentW * 0.65f);
-                if (ImGui::SliderFloat("Mesh Detail", &m_config->meshDetail, 32.0f, 128.0f, "%.0f"))
-                    changed = true;
-                ImGui::SameLine(); ImGui::TextDisabled("(?)");
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Warp mesh resolution.\nHigher = smoother warps but slower.\nLower = faster but blockier effects.");
-            }
-
-            ImGui::Spacing();
 
             ImGui::SeparatorText("Input");
             {
@@ -1822,8 +1961,8 @@ MenuAction MenuOverlay::renderSettings()
             // License file status
             ImGui::SeparatorText("License File Bundling Status");
             ImGui::Spacing();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.75f, 0.3f, 1.0f));
-            ImGui::TextWrapped("WARNING: License notice files are not yet bundled with this build. Required before any commercial distribution.");
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.55f, 1.0f, 0.65f, 1.0f));
+            ImGui::TextWrapped("Third-party notice files are bundled in the licenses folder beside Vibeus.exe.");
             ImGui::PopStyleColor();
             ImGui::Spacing();
 
@@ -1836,11 +1975,13 @@ MenuAction MenuOverlay::renderSettings()
                 ImGui::TextDisabled("%s", status);
             };
 
-            licRow("LICENSE_projectM.txt    (LGPL-2.1)",  "MISSING — required for distribution");
-            licRow("LICENSE_SDL2.txt        (zlib)",      "MISSING — required for distribution");
-            licRow("LICENSE_ImGui.txt       (MIT)",       "MISSING — required for distribution");
-            licRow("LICENSE_nlohmann.txt    (MIT)",       "MISSING — required for distribution");
-            licRow("CREDITS_presets.txt     (community)", "MISSING — required for distribution");
+            licRow("LICENSE_projectM.txt              (LGPL-2.1)", "BUNDLED");
+            licRow("NOTICE_projectM.txt               (projectM)",  "BUNDLED");
+            licRow("LICENSE_SDL2.txt                  (zlib)",      "BUNDLED");
+            licRow("LICENSE_ImGui.txt                 (MIT)",       "BUNDLED");
+            licRow("LICENSE_nlohmann_json.txt         (MIT)",       "BUNDLED");
+            licRow("LICENSE_presets_cream_of_the_crop.md",          "BUNDLED");
+            licRow("CREDITS_presets_cream_of_the_crop.txt",         "BUNDLED");
 
             ImGui::Spacing();
             ImGui::Separator();

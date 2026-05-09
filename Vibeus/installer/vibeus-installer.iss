@@ -67,6 +67,7 @@ Source: "{#PresetsDir}\*"; DestDir: "{app}\presets"; Flags: ignoreversion recurs
 ; Option 2: Or follow symlink with external flag
 ; Source: "{#BuildOutputDir}\presets\*"; DestDir: "{app}\presets"; Flags: ignoreversion recursesubdirs createallsubdirs external skipifsourcedoesntexist
 Source: "{#BuildOutputDir}\textures\*"; DestDir: "{app}\textures"; Flags: ignoreversion recursesubdirs createallsubdirs external skipifsourcedoesntexist
+Source: "{#BuildOutputDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 ; Optional: User-specific files (favorites now stored per-user in AppData)
 ; Source: "{#BuildOutputDir}\favorites.txt"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
@@ -89,6 +90,7 @@ Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Description: "{cm:Launch
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\presets"
 Type: filesandordirs; Name: "{app}\textures"
+Type: filesandordirs; Name: "{app}\licenses"
 
 [Code]
 // Check if Visual C++ 2022 Redistributable is installed

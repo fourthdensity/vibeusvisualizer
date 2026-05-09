@@ -13,14 +13,14 @@ find_package(SDL2 CONFIG REQUIRED)
 # OpenGL
 find_package(OpenGL REQUIRED)
 
-# Dear ImGui (via vcpkg - core + opengl3 backend; SDL2 backend vendored in src/)
+# Dear ImGui (via vcpkg - core + opengl3 backend; SDL2 backend vendored in Vibeus/src/)
 find_package(imgui CONFIG REQUIRED)
 
 # nlohmann/json (via vcpkg - for config persistence)
 find_package(nlohmann_json CONFIG REQUIRED)
 
 # projectM - point to the built library
-set(PROJECTM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../projectchilltitties" CACHE PATH "Path to projectM source root")
+set(PROJECTM_ROOT "F:/chilltittiesvisualizer - Copy/projectchilltitties" CACHE PATH "Path to projectM source root")
 set(PROJECTM_BUILD "${PROJECTM_ROOT}/build" CACHE PATH "Path to projectM build directory")
 
 # projectM include dirs (source + generated export headers)
@@ -65,24 +65,26 @@ message(STATUS "projectM playlist library: ${PROJECTM_PLAYLIST_LIBRARY}")
 
 # --- Sources ---
 set(SOURCES
-    src/main.cpp
-    src/audio_capture.cpp
-    src/preset_manager.cpp
-    src/preset_database.cpp
-    src/menu_overlay.cpp
-    src/config.cpp
-    src/imgui_impl_sdl2.cpp
-    src/storyteller.cpp
+    Vibeus/src/main.cpp
+    Vibeus/src/audio_capture.cpp
+    Vibeus/src/preset_manager.cpp
+    Vibeus/src/preset_database.cpp
+    Vibeus/src/menu_overlay.cpp
+    Vibeus/src/config.cpp
+    Vibeus/src/imgui_impl_sdl2.cpp
+    Vibeus/src/storyteller.cpp
+    Vibeus/src/transition_compositor.cpp
 )
 
 set(HEADERS
-    src/audio_capture.h
-    src/preset_manager.h
-    src/preset_database.h
-    src/menu_overlay.h
-    src/config.h
-    src/imgui_impl_sdl2.h
-    src/storyteller.h
+    Vibeus/src/audio_capture.h
+    Vibeus/src/preset_manager.h
+    Vibeus/src/preset_database.h
+    Vibeus/src/menu_overlay.h
+    Vibeus/src/config.h
+    Vibeus/src/imgui_impl_sdl2.h
+    Vibeus/src/storyteller.h
+    Vibeus/src/transition_compositor.h
 )
 
 # --- Executable ---
@@ -91,7 +93,7 @@ add_executable(${PROJECT_NAME} WIN32 ${SOURCES} ${HEADERS})
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${PROJECTM_INCLUDE_DIRS}
     ${PROJECTM_PLAYLIST_INCLUDE_DIRS}
-    src
+    Vibeus/src
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -122,7 +124,7 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
 )
 
 # --- Post-build: copy textures (if available) ---
-set(TEXTURE_PACK_DIR "${CMAKE_SOURCE_DIR}/../presets-milkdrop-texture-pack/textures")
+set(TEXTURE_PACK_DIR "F:/chilltittiesvisualizer - Copy/presets-milkdrop-texture-pack/textures")
 if(EXISTS "${TEXTURE_PACK_DIR}")
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -132,5 +134,19 @@ if(EXISTS "${TEXTURE_PACK_DIR}")
     )
 endif()
 
+# --- Post-build: copy third-party license notices ---
+set(VIBEUS_LICENSE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/Vibeus/licenses")
+if(EXISTS "${VIBEUS_LICENSE_DIR}")
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${VIBEUS_LICENSE_DIR}"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/licenses"
+        COMMENT "Copying third-party license notices to output directory"
+    )
+endif()
+
 # Install target (basic)
 install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
+if(EXISTS "${VIBEUS_LICENSE_DIR}")
+    install(DIRECTORY "${VIBEUS_LICENSE_DIR}/" DESTINATION licenses)
+endif()

@@ -55,6 +55,7 @@
 #include "storyteller.h"
 #include "menu_overlay.h"
 #include "config.h"
+#include "transition_compositor.h"
 
 #include <imgui.h>
 
@@ -89,6 +90,7 @@ static AudioCapture  g_audio;
 static PresetManager g_presets;
 static MenuOverlay   g_menu;
 static PresetDatabase g_presetDb;   // category-aware preset index (for browser)
+static TransitionCompositor g_transitionCompositor;
 Storyteller g_storyteller;
 
 // Configuration (persisted to JSON)
@@ -548,6 +550,67 @@ static void attachConsole()
 
 // ----- Helpers -----
 
+static float compositorDurationForStyle(int style, bool hardCut)
+{
+    float base = std::clamp(g_config.transitionCrossfadeDuration, 0.50f, 1.20f);
+
+    switch (style) {
+    case 2:  // Slow Morph
+    case 8:  // Long Dissolve
+    case 11: // Breathing Fade
+    case 14: // Ambient Wash
+        return base * 1.20f;
+    case 5:  // Zoom Burst
+    case 13: // Liquid Drift
+    case 16: // Deep Bloom
+    case 17: // Afterimage
+        return base * 1.05f;
+    case 4:  // Glitch Cut
+    case 7:  // Snap Fade
+    case 10: // Bass Slam
+    case 12: // Clean Slate
+    case 18: // Drop Smash
+        return (std::max)(0.60f, base * (hardCut ? 0.85f : 0.95f));
+    default:
+        return base;
+    }
+}
+
+static void triggerTransitionCompositor(bool hardCut, const char* reason)
+{
+    if (!g_config.transitionCompositorEnabled || !g_transitionCompositor.isAvailable())
+        return;
+
+    float duration = compositorDurationForStyle(g_config.storyTransitionStyle, hardCut);
+    g_transitionCompositor.trigger(g_config.storyTransitionStyle, duration, g_config.reducedMotion);
+
+    if (g_debug) {
+        fprintf(stderr, "[Vibeus] Transition compositor pulse: %s\n", reason ? reason : "preset-change");
+    }
+}
+
+static void detectPresetChangeForCompositor()
+{
+    static std::string lastPresetPath;
+
+    if (!g_config.transitionCompositorEnabled || !g_transitionCompositor.isAvailable())
+        return;
+
+    std::string current = g_presets.currentPresetName();
+    if (current.empty())
+        return;
+
+    if (lastPresetPath.empty()) {
+        lastPresetPath = current;
+        return;
+    }
+
+    if (current != lastPresetPath) {
+        triggerTransitionCompositor(false, "preset-change");
+        lastPresetPath = current;
+    }
+}
+
 static std::string getUserDataDir()
 {
     // SDL_GetPrefPath returns a per-user writable directory and creates it if needed.
@@ -564,14 +627,18 @@ static std::string getUserDataDir()
 
 static std::string findPresetsDir()
 {
-    // Check common locations relative to the executable
+    // Check common locations relative to the executable (and known dev locations after directory move)
     const char* base = SDL_GetBasePath();
     auto exePath = fs::path(base ? base : "");
     std::string candidates[] = {
         (exePath / "presets").string(),
         (exePath / ".." / "presets").string(),
         (exePath / ".." / ".." / "presets").string(),
+        (exePath / ".." / ".." / ".." / "presets-cream-of-the-crop").string(),
+        "F:/chilltittiesvisualizer - Copy/presets-cream-of-the-crop",
+        "F:/chilltittiesvisualizer - Copy/projectchilltitties/presets",
         "presets",
+        "presets-cream-of-the-crop",
     };
     for (auto& path : candidates) {
         if (fs::exists(path) && fs::is_directory(path))
@@ -717,7 +784,7 @@ static void handleKeyDown(SDL_Keysym key)
         return;
     }
     if (sym == g_config.keyRandomPreset) {
-        g_presets.next(true); // hard cut = random jump
+        g_presets.playRandom(true);
         toastInput("Random preset");
         return;
     }
@@ -963,7 +1030,7 @@ static void processEvents()
                 continue;
             }
             if (btn == g_config.gpRandomPreset) {
-                g_presets.next(true); // hard cut
+                g_presets.playRandom(true);
                 toastInput("Random preset");
                 continue;
             }
@@ -1138,9 +1205,10 @@ static void applyConfig(const VibeusConfig& cfg)
         setBeatSensitivity(effectiveSensitivity, "applyConfig");
 
         // Presets
+        bool compositorOwnsTransitions = cfg.transitionCompositorEnabled && g_transitionCompositor.isAvailable();
         projectm_set_preset_duration(g_pm, cfg.presetDuration);
-        projectm_set_soft_cut_duration(g_pm, cfg.transitionTime);
-        projectm_set_hard_cut_enabled(g_pm, cfg.autoAdvance && cfg.hardCutEnabled);
+        projectm_set_soft_cut_duration(g_pm, compositorOwnsTransitions ? 0.05f : cfg.transitionTime);
+        projectm_set_hard_cut_enabled(g_pm, cfg.autoAdvance && cfg.hardCutEnabled && !cfg.storytellingEnabled);
         projectm_set_hard_cut_sensitivity(g_pm, cfg.hardCutSensitivity);
         projectm_set_hard_cut_duration(g_pm, cfg.hardCutDuration);
         projectm_set_easter_egg(g_pm, cfg.easterEgg);  // Preset variety
@@ -1372,6 +1440,9 @@ static void handleMenuAction(MenuAction action)
             ss.dropRatioGate       = g_config.storyDropRatio;
             ss.dropBassGate        = g_config.storyDropBass;
             ss.dropFluxGate        = g_config.storyDropFlux;
+            ss.beatReactivity      = g_config.beatReactivity;
+            ss.debugMode           = g_config.storyDebug;
+            ss.externalTransitionCompositor = g_config.transitionCompositorEnabled && g_transitionCompositor.isAvailable();
             g_storyteller.applySettings(ss);
         }
         g_menu.showToast("Transition settings applied");
@@ -1464,6 +1535,10 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    if (!g_transitionCompositor.init()) {
+        fprintf(stderr, "[Vibeus] WARNING: Transition compositor unavailable; using direct projectM rendering\n");
+    }
+
     // 4. Initialize audio capture
     if (!g_audio.init()) {
         fprintf(stderr, "[Vibeus] WARNING: Audio capture failed - visuals won't react to music\n");
@@ -1477,6 +1552,10 @@ int main(int argc, char* argv[])
     // 8. Apply blacklists (fast)
     g_presets.applyBlacklist(g_brokenPresetBlacklistPath);
     g_presets.applyBlacklist(g_userBlacklistPath);
+
+    if (!g_presets.playRandom(true)) {
+        fprintf(stderr, "[Vibeus] WARNING: Could not choose a random startup preset\n");
+    }
 
     fprintf(stderr, "\n[Vibeus] Ready! %u presets loaded. Shuffle: %s\n",
             g_presets.count(), g_presets.isShuffled() ? "ON" : "OFF");
@@ -1608,6 +1687,7 @@ int main(int argc, char* argv[])
                         silenceTimer += deltaTime;
                         if (silenceTimer >= g_config.stasisFadeTime && !g_inStasis) {
                             g_inStasis = true;
+                            g_transitionCompositor.cancel();
                             fprintf(stderr,
                                     "[Stasis] Entered silence freeze (rms=%.4f threshold=%.4f delay=%.2fs)\n",
                                     rms, g_config.stasisThreshold, g_config.stasisFadeTime);
@@ -1659,14 +1739,27 @@ int main(int argc, char* argv[])
                     ss.dropBassGate      = g_config.storyDropBass;
                     ss.dropFluxGate      = g_config.storyDropFlux;
                     ss.beatReactivity    = g_config.beatReactivity;
+                    ss.externalTransitionCompositor = g_config.transitionCompositorEnabled && g_transitionCompositor.isAvailable();
                     g_storyteller.applySettings(ss);
 
-                    g_storyteller.update(g_audio.levelPeak(),
-                                         g_audio.levelBass(),
-                                         g_audio.levelBeatBass(),
-                                         g_audio.levelBeatMid(),
-                                         g_audio.levelBeatHigh(),
-                                         deltaTime);
+                    // Consume onset flags before calling update — they are
+                    // cleared on read, so the order matters here.
+                    bool onL = g_audio.onsetLow();
+                    bool onM = g_audio.onsetMid();
+                    bool onH = g_audio.onsetHigh();
+                    g_storyteller.update(
+                        g_audio.levelPeak(),
+                        // raw band energies (bass / mid / high)
+                        g_audio.levelBass(),
+                        g_audio.levelBeatMid(),
+                        g_audio.levelBeatHigh(),
+                        // beat-filtered per-band (kick / snare+mid / hats)
+                        g_audio.levelBeatBass(),
+                        g_audio.levelBeatMid(),
+                        g_audio.levelBeatHigh(),
+                        // onset flags (consumed — cleared after this call)
+                        onL, onM, onH,
+                        deltaTime);
                 } else if (g_inStasis) {
                     // In stasis: freeze storyteller and kill beat reactivity
                     setBeatSensitivity(0.0f, "stasis");
@@ -1694,8 +1787,28 @@ int main(int argc, char* argv[])
                     float fixedSens = g_config.beatSensitivity;
                     setBeatSensitivity(fixedSens, "non-adaptive");
                 }
+
+                if (!g_inStasis)
+                    detectPresetChangeForCompositor();
+
                 // Render visualization frame
-                projectm_opengl_render_frame(g_pm);
+                int renderW = 0, renderH = 0;
+                SDL_GetWindowSize(g_window, &renderW, &renderH);
+                if (!g_inStasis &&
+                    g_config.transitionCompositorEnabled &&
+                    g_transitionCompositor.beginScene(renderW, renderH)) {
+                    projectm_opengl_render_frame(g_pm);
+                    g_transitionCompositor.endScene();
+                    g_transitionCompositor.renderToScreen(renderW, renderH);
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                } else {
+                    projectm_opengl_render_frame(g_pm);
+                    if (g_config.transitionCompositorEnabled &&
+                        g_transitionCompositor.isAvailable()) {
+                        g_transitionCompositor.captureHistoryFromScreen(renderW, renderH);
+                    }
+                }
 
                 // Beat detection: use band-limited kick energy + flux with adaptive floor
                 const float bassEnergy = g_audio.levelBeatBass(); // <150Hz kick band
@@ -1819,6 +1932,7 @@ int main(int argc, char* argv[])
     saveConfig(g_config, g_configPath);
 
     g_menu.shutdown();
+    g_transitionCompositor.shutdown();
     g_audio.shutdown();
     if (g_gamepad) {
         SDL_GameControllerClose(g_gamepad);

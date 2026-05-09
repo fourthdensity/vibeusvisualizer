@@ -31,6 +31,8 @@ VibeusConfig loadConfig(const std::string& path)
         get("hardCutEnabled",   cfg.hardCutEnabled);
         get("hardCutSensitivity", cfg.hardCutSensitivity);
         get("hardCutDuration",  cfg.hardCutDuration);
+        get("transitionCompositorEnabled", cfg.transitionCompositorEnabled);
+        get("transitionCrossfadeDuration", cfg.transitionCrossfadeDuration);
         get("easterEgg",       cfg.easterEgg);
         get("fullscreen",      cfg.fullscreen);
         // uiScale removed - was never implemented
@@ -128,6 +130,8 @@ bool saveConfig(const VibeusConfig& cfg, const std::string& path)
     j["hardCutEnabled"]   = cfg.hardCutEnabled;
     j["hardCutSensitivity"] = cfg.hardCutSensitivity;
     j["hardCutDuration"]  = cfg.hardCutDuration;
+    j["transitionCompositorEnabled"] = cfg.transitionCompositorEnabled;
+    j["transitionCrossfadeDuration"] = cfg.transitionCrossfadeDuration;
     j["easterEgg"]       = cfg.easterEgg;
     j["fullscreen"]      = cfg.fullscreen;
     // uiScale removed - was never implemented

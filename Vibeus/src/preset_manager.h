@@ -5,6 +5,8 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <deque>
+#include <random>
 
 /// Wraps the projectM playlist library for easy preset management
 class PresetManager {
@@ -43,6 +45,9 @@ public:
     /// Go back in history
     void last(bool hardCut = false);
 
+    /// Jump to a random available preset in the current live playlist.
+    bool playRandom(bool hardCut = true);
+
     /// Toggle shuffle mode
     void toggleShuffle();
     bool isShuffled() const;
@@ -59,6 +64,11 @@ public:
     projectm_playlist_handle handle() const { return m_playlist; }
 
 private:
+    bool playPosition(uint32_t pos, bool hardCut, const char* reason);
+    bool chooseRandomPosition(uint32_t& pos);
+    void rememberPosition(uint32_t pos, const std::string& presetPath);
+    std::string presetPathAt(uint32_t pos) const;
+
     /// Remove presets by index (sorted descending)
     void removePresets(const std::vector<uint32_t>& indices);
     
@@ -70,4 +80,7 @@ private:
     projectm_handle          m_pm       = nullptr;
     bool                     m_shuffle  = true;
     std::vector<std::string> m_brokenPresets; // Track broken preset paths
+    std::deque<uint32_t>     m_recentPositions;
+    std::deque<std::string>  m_recentPresetPaths;
+    std::mt19937            m_rng{ std::random_device{}() };
 };
