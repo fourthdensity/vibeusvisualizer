@@ -8,13 +8,9 @@
 /// A clean-slate implementation that provides full creative control
 /// without any LGPL dependencies.
 ///
-/// This is a basic placeholder implementation that demonstrates the abstraction.
-/// Future enhancements can include:
-/// - Custom shader system (GLSL-based effects)
-/// - Modern GPU compute for audio analysis
-/// - Custom preset format (JSON/YAML-based)
-/// - Advanced beat detection and state machines
-/// - ML-based audio feature extraction
+/// Enhanced v0.5.0: Visual Modes (Classic/Nebula/Tunnel/Symmetry), Shockwave rings,
+/// Starfield, Beat-reactive mode switching, Enhanced particle physics,
+/// Ready for GLSL shaders (example code included in .cpp).
 class VibeusVisualizer : public IVisualizer {
 public:
     VibeusVisualizer() = default;
@@ -83,6 +79,25 @@ private:
     int m_meshHeight = 48;
     bool m_aspectCorrection = true;
     float m_easterEgg = 0.0f;
+
+    // Enhanced visual state
+    struct Particle {
+        float x, y, vx, vy, life, size, hue;
+    };
+    struct Shockwave {
+        float x, y, radius, alpha, hue;
+    };
+    struct Star {
+        float x, y, twinkleSpeed, brightness;
+    };
+    std::vector<Particle> m_particles;
+    std::vector<float> m_spectrum;
+    std::vector<Shockwave> m_shockwaves;
+    std::vector<Star> m_stars;
+    int m_visualMode = 0;
+    float m_effectTime = 0.0f;
+    int m_beatCount = 0;
+    float m_lastBeatIntensity = 0.0f;
 
     // Debug
     int m_logLevel = 2; // 2=warn
