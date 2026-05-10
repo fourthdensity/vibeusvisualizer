@@ -572,6 +572,7 @@ MenuAction MenuOverlay::renderPauseMenu()
 
 // ─── Preset Browser ─────────────────────────────────────────────────
 
+#ifdef USE_PROJECTM_BACKEND
 void MenuOverlay::loadPresetList(projectm_playlist_handle playlist)
 {
     m_presetList.clear();
@@ -603,6 +604,7 @@ void MenuOverlay::loadPresetList(projectm_playlist_handle playlist)
 
     projectm_playlist_free_string_array(items);
 }
+#endif
 
 MenuAction MenuOverlay::renderPresetBrowser()
 {

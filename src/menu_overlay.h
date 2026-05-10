@@ -1,7 +1,9 @@
 #pragma once
 
 #include <SDL.h>
+#ifdef USE_PROJECTM_BACKEND
 #include <projectM-4/playlist.h>
+#endif
 
 #include "config.h"
 #include "preset_database.h"
@@ -58,8 +60,10 @@ public:
     // Render the current screen. Returns any action selected this frame.
     MenuAction render();
 
+#ifdef USE_PROJECTM_BACKEND
     // Preset browser: load preset list from playlist manager
     void loadPresetList(projectm_playlist_handle playlist);
+#endif
 
     // Preset browser: get the selected browser/database index (legacy fallback)
     uint32_t selectedPresetIndex() const { return m_selectedPreset; }

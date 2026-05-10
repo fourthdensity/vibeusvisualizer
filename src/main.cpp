@@ -1,9 +1,15 @@
 #include "IVisualizer.h"
+#ifdef USE_PROJECTM_BACKEND
 #include "ProjectMVisualizer.h"
+#endif
+#ifdef USE_VIBEUS_BACKEND
 #include "VibeusVisualizer.h"
+#endif
 
 #include "audio_capture.h"
+#ifdef USE_PROJECTM_BACKEND
 #include "preset_manager.h"
+#endif
 #include "preset_database.h"
 #include "storyteller.h"
 #include "menu_overlay.h"
@@ -41,7 +47,9 @@ static bool          g_debug    = false;
 static bool          g_inStasis = false;
 
 static AudioCapture  g_audio;
+#ifdef USE_PROJECTM_BACKEND
 static PresetManager g_presets;
+#endif
 static MenuOverlay   g_menu;
 static PresetDatabase g_presetDb;
 Storyteller g_storyteller;
@@ -82,6 +90,8 @@ static void setBeatSensitivity(float value, const char* reason);
 static bool   g_mouseDown       = false;
 static int    g_touchPressure   = 1;
 static int    g_touchTypeIndex  = 0;
+
+#ifdef USE_PROJECTM_BACKEND
 static constexpr projectm_touch_type g_touchTypes[] = {
     PROJECTM_TOUCH_TYPE_RANDOM,
     PROJECTM_TOUCH_TYPE_CIRCLE,
@@ -94,11 +104,15 @@ static constexpr projectm_touch_type g_touchTypes[] = {
     PROJECTM_TOUCH_TYPE_DOUBLE_LINE,
 };
 static constexpr int g_touchTypeCount = sizeof(g_touchTypes) / sizeof(g_touchTypes[0]);
+#else
+static constexpr int g_touchTypeCount = 0;
+#endif
 
 static SDL_GameController* g_gamepad = nullptr;
 
 static bool  g_flowMode = false;
 
+#ifdef USE_PROJECTM_BACKEND
 struct Ripple {
     float cx, cy;
     Uint32 startMs;
@@ -110,10 +124,12 @@ struct Ripple {
 };
 
 static std::vector<Ripple> g_ripples;
+#endif
 
 static int    g_prevMouseX = 0, g_prevMouseY = 0;
 static Uint32 g_prevMouseMs = 0;
 
+#ifdef USE_PROJECTM_BACKEND
 static void spawnRipple(float nx, float ny, float intensity = 1.0f)
 {
     Ripple r;
@@ -166,7 +182,9 @@ static void processRipples()
         ++it;
     }
 }
+#endif
 
+#ifdef USE_PROJECTM_BACKEND
 static void processVelocityTrail(int mx, int my)
 {
     Uint32 now = SDL_GetTicks();
@@ -250,11 +268,12 @@ static void projectmLogCallback(const char* message, projectm_log_level level, v
         fprintf(g_validationLogFile, "[projectM/%s] %s\n", logLevelStr(level), message);
         fflush(g_validationLogFile);
     }
-    
+
     if (g_captureProjectMErrors && level == PROJECTM_LOG_LEVEL_ERROR) {
         g_lastPresetHadError = true;
     }
 }
+#endif // USE_PROJECTM_BACKEND
 
 static void updateDebugTitle()
 {

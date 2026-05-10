@@ -3,7 +3,9 @@
 #ifdef WASAPI_LOOPBACK
 
 #include <functiondiscoverykeys_devpkey.h>
+#ifdef USE_PROJECTM_BACKEND
 #include <projectM-4/audio.h>
+#endif
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -177,6 +179,7 @@ bool AudioCapture::init()
     return true;
 }
 
+#ifdef USE_PROJECTM_BACKEND
 void AudioCapture::feedAudio(projectm_handle pm, float gain)
 {
     if (!m_initialized || !pm)
@@ -226,6 +229,7 @@ void AudioCapture::feedAudio(projectm_handle pm, float gain)
         decayLevels();
     }
 }
+#endif
 
 void AudioCapture::feedAudio(IVisualizer* viz, float gain)
 {

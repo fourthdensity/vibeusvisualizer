@@ -5,8 +5,11 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
-#include <projectM-4/types.h>
 #include <vector>
+
+#ifdef USE_PROJECTM_BACKEND
+#include <projectM-4/types.h>
+#endif
 
 class IVisualizer;  // forward declaration for abstraction
 
@@ -20,8 +23,10 @@ public:
     /// Returns true on success.
     bool init();
 
+#ifdef USE_PROJECTM_BACKEND
     /// Drain any available audio packets and feed them to projectM (legacy).
     void feedAudio(projectm_handle pm, float gain = 1.0f);
+#endif
 
     /// New: Feed to any IVisualizer backend (abstraction layer)
     void feedAudio(IVisualizer* viz, float gain = 1.0f);
@@ -120,7 +125,9 @@ class IVisualizer;
 class AudioCapture {
 public:
     bool init() { return false; }
+#ifdef USE_PROJECTM_BACKEND
     void feedAudio(projectm_handle, float = 1.0f) {}
+#endif
     void feedAudio(IVisualizer*, float = 1.0f) {}
     float levelRms()  const { return 0.0f; }
     float levelPeak() const { return 0.0f; }
