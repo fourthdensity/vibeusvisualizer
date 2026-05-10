@@ -74,7 +74,6 @@ endif()
 set(SOURCES
     src/main.cpp
     src/audio_capture.cpp
-    src/preset_manager.cpp
     src/preset_database.cpp
     src/menu_overlay.cpp
     src/config.cpp
@@ -84,7 +83,6 @@ set(SOURCES
 
 set(HEADERS
     src/audio_capture.h
-    src/preset_manager.h
     src/preset_database.h
     src/menu_overlay.h
     src/config.h
@@ -95,8 +93,8 @@ set(HEADERS
 
 # Add backend-specific sources
 if(USE_PROJECTM)
-    list(APPEND SOURCES src/ProjectMVisualizer.cpp)
-    list(APPEND HEADERS src/ProjectMVisualizer.h)
+    list(APPEND SOURCES src/ProjectMVisualizer.cpp src/preset_manager.cpp)
+    list(APPEND HEADERS src/ProjectMVisualizer.h src/preset_manager.h)
 endif()
 
 if(USE_VIBEUS_BACKEND)
