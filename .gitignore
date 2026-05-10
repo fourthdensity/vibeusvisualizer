@@ -1,0 +1,60 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+CMakeSettings.json
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Compiled binaries (never commit these)
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.ilk
+*.exp
+
+# vcpkg local installs (use vcpkg.json manifest instead)
+vcpkg_installed/
+
+# GSD (GitHub Copilot Session Data) - internal state, not for version control
+.gsd/
+.bg-shell/
+
+# Temporary / backup files
+*.bak
+*.log
+bridge_mcp.js
+
+# Preset files (large, from external repo - don't bundle)
+presets/
+
+# Secrets / keys
+*.env
+*.key
+*.pem
+secrets.*
+
+# ── Vibeus proprietary / internal strategy ──
+# These files contain competitive research, pricing strategy,
+# product roadmap, and UX design documents. Keep local only.
+ROADMAP.md
+docs/SETTINGS_DESIGN.md
+docs/PERFORMANCE_GUIDE.md
+docs/internal/
+
+# Runtime config (user-generated, not for repo)
+vibeus_config.json
+favorites.txt
