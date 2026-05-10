@@ -1,0 +1,173 @@
+cmake_minimum_required(VERSION 3.21)
+project(Vibeus VERSION 0.1.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# --- Dependencies ---
+
+# SDL2 (via vcpkg or system)
+find_package(SDL2 CONFIG REQUIRED)
+
+# OpenGL
+find_package(OpenGL REQUIRED)
+
+# Dear ImGui (via vcpkg - core + opengl3 backend; SDL2 backend vendored in src/)
+find_package(imgui CONFIG REQUIRED)
+
+# nlohmann/json (via vcpkg - for config persistence)
+find_package(nlohmann_json CONFIG REQUIRED)
+
+# --- Visualization Backend Selection ---
+option(USE_PROJECTM "Use ProjectM as the visualization backend (legacy, requires projectM built from source)" OFF)
+option(USE_VIBEUS_BACKEND "Use Vibeus custom visualization backend" ON)
+
+if(USE_PROJECTM)
+    # projectM - point to the built library
+    set(PROJECTM_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../projectchilltitties" CACHE PATH "Path to projectM source root")
+    set(PROJECTM_BUILD "${PROJECTM_ROOT}/build" CACHE PATH "Path to projectM build directory")
+
+    # projectM include dirs (source + generated export headers)
+    set(PROJECTM_INCLUDE_DIRS
+        "${PROJECTM_ROOT}/src/api/include"
+        "${PROJECTM_BUILD}/src/api/include"          # for generated projectM_export.h
+    )
+
+    # Playlist include dirs (source + generated export headers)
+    set(PROJECTM_PLAYLIST_INCLUDE_DIRS
+        "${PROJECTM_ROOT}/src/playlist/api"
+        "${PROJECTM_BUILD}/src/playlist/include"     # for generated projectM_playlist_export.h
+    )
+
+    # projectM libraries
+    find_library(PROJECTM_LIBRARY
+        NAMES projectM-4
+        PATHS "${PROJECTM_BUILD}/src/libprojectM/Release"
+              "${PROJECTM_BUILD}/src/libprojectM/Debug"
+              "${PROJECTM_BUILD}/src/libprojectM"
+        NO_DEFAULT_PATH
+    )
+
+    find_library(PROJECTM_PLAYLIST_LIBRARY
+        NAMES projectM-4-playlist
+        PATHS "${PROJECTM_BUILD}/src/playlist/Release"
+              "${PROJECTM_BUILD}/src/playlist/Debug"
+              "${PROJECTM_BUILD}/src/playlist"
+        NO_DEFAULT_PATH
+    )
+
+    if(NOT PROJECTM_LIBRARY)
+        message(FATAL_ERROR "Could not find projectM-4 library. Set PROJECTM_BUILD to the projectM build directory.")
+    endif()
+
+    if(NOT PROJECTM_PLAYLIST_LIBRARY)
+        message(FATAL_ERROR "Could not find projectM-4-playlist library. Set PROJECTM_BUILD to the projectM build directory.")
+    endif()
+
+    message(STATUS "projectM library: ${PROJECTM_LIBRARY}")
+    message(STATUS "projectM playlist library: ${PROJECTM_PLAYLIST_LIBRARY}")
+    message(STATUS "Using ProjectM visualization backend")
+endif()
+
+# --- Sources ---
+set(SOURCES
+    src/main.cpp
+    src/audio_capture.cpp
+    src/preset_manager.cpp
+    src/preset_database.cpp
+    src/menu_overlay.cpp
+    src/config.cpp
+    src/imgui_impl_sdl2.cpp
+    src/storyteller.cpp
+)
+
+set(HEADERS
+    src/audio_capture.h
+    src/preset_manager.h
+    src/preset_database.h
+    src/menu_overlay.h
+    src/config.h
+    src/imgui_impl_sdl2.h
+    src/storyteller.h
+    src/IVisualizer.h
+)
+
+# Add backend-specific sources
+if(USE_PROJECTM)
+    list(APPEND SOURCES src/ProjectMVisualizer.cpp)
+    list(APPEND HEADERS src/ProjectMVisualizer.h)
+endif()
+
+if(USE_VIBEUS_BACKEND)
+    list(APPEND SOURCES src/VibeusVisualizer.cpp)
+    list(APPEND HEADERS src/VibeusVisualizer.h)
+    message(STATUS "Using Vibeus custom visualization backend")
+endif()
+
+# --- Executable ---
+add_executable(${PROJECT_NAME} WIN32 ${SOURCES} ${HEADERS})
+
+target_include_directories(${PROJECT_NAME} PRIVATE src)
+
+# Add backend-specific includes and definitions
+if(USE_PROJECTM)
+    target_include_directories(${PROJECT_NAME} PRIVATE
+        ${PROJECTM_INCLUDE_DIRS}
+        ${PROJECTM_PLAYLIST_INCLUDE_DIRS}
+    )
+    target_compile_definitions(${PROJECT_NAME} PRIVATE USE_PROJECTM_BACKEND)
+endif()
+
+if(USE_VIBEUS_BACKEND)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE USE_VIBEUS_BACKEND)
+endif()
+
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    SDL2::SDL2
+    SDL2::SDL2main
+    OpenGL::GL
+    imgui::imgui
+    nlohmann_json::nlohmann_json
+)
+
+# Link backend-specific libraries
+if(USE_PROJECTM)
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        ${PROJECTM_LIBRARY}
+        ${PROJECTM_PLAYLIST_LIBRARY}
+    )
+endif()
+
+# Windows-specific: WASAPI audio loopback
+if(WIN32)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE WASAPI_LOOPBACK)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ole32 avrt)
+endif()
+
+# --- Post-build: copy DLLs ---
+if(USE_PROJECTM AND WIN32)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${PROJECTM_BUILD}/src/libprojectM/$<CONFIG>/projectM-4.dll"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${PROJECTM_BUILD}/src/playlist/$<CONFIG>/projectM-4-playlist.dll"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+        COMMENT "Copying projectM DLLs to output directory"
+    )
+endif()
+
+# --- Post-build: copy textures (if available) ---
+set(TEXTURE_PACK_DIR "${CMAKE_SOURCE_DIR}/../presets-milkdrop-texture-pack/textures")
+if(EXISTS "${TEXTURE_PACK_DIR}")
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${TEXTURE_PACK_DIR}"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/textures"
+        COMMENT "Copying Milkdrop texture pack to output directory"
+    )
+endif()
+
+# Install target (basic)
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION bin)
