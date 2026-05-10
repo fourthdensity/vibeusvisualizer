@@ -13,6 +13,8 @@
 #include <mmreg.h>
 #include <ksmedia.h>
 
+#include "IVisualizer.h"
+
 AudioCapture::~AudioCapture()
 {
     shutdown();
@@ -26,14 +28,12 @@ bool AudioCapture::init()
     if (SUCCEEDED(hr)) {
         m_comInit = true;
     } else if (hr == RPC_E_CHANGED_MODE) {
-        // COM already initialized with different threading model - that's OK
         m_comInit = false;
     } else {
         fprintf(stderr, "[AudioCapture] CoInitializeEx failed: 0x%08lx\n", hr);
         return false;
     }
 
-    // Get default audio render device (speakers/headphones)
     IMMDeviceEnumerator* enumerator = nullptr;
     hr = CoCreateInstance(
         __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
@@ -50,7 +50,6 @@ bool AudioCapture::init()
         return false;
     }
 
-    // Activate audio client
     hr = m_device->Activate(
         __uuidof(IAudioClient), CLSCTX_ALL, nullptr,
         reinterpret_cast<void**>(&m_audioClient));
@@ -59,7 +58,6 @@ bool AudioCapture::init()
         return false;
     }
 
-    // Get mix format
     WAVEFORMATEX* mixFormat = nullptr;
     hr = m_audioClient->GetMixFormat(&mixFormat);
     if (FAILED(hr)) {
@@ -67,7 +65,6 @@ bool AudioCapture::init()
         return false;
     }
 
-    // Cache format details (many systems are NOT float stereo)
     m_channels = mixFormat->nChannels;
     m_bitsPerSample = mixFormat->wBitsPerSample;
     m_validBitsPerSample = mixFormat->wBitsPerSample;
@@ -94,7 +91,6 @@ bool AudioCapture::init()
             static_cast<unsigned>(m_sampleRate),
             m_isFloat ? "float" : "pcm");
 
-    // Initialize Biquad LPF coeffs for Beat Detection (150Hz cutoff for low band)
     {
         double fc = 150.0;
         double fs = static_cast<double>(m_sampleRate);
@@ -102,7 +98,7 @@ bool AudioCapture::init()
             double omega = 2.0 * 3.14159265358979323846 * fc / fs;
             double sn = std::sin(omega);
             double cs = std::cos(omega);
-            double alpha = sn / (2.0 * 0.70710678118654752440); // Q = 0.707
+            double alpha = sn / (2.0 * 0.70710678118654752440);
 
             double a0 = 1.0 + alpha;
             m_bqLowB0 = ((1.0 - cs) / 2.0) / a0;
@@ -113,7 +109,6 @@ bool AudioCapture::init()
         }
     }
     
-    // Initialize Biquad BPF coeffs for Mid band (1.5kHz center, Q=0.707 for wide band)
     {
         double fc = 1500.0;
         double fs = static_cast<double>(m_sampleRate);
@@ -121,7 +116,7 @@ bool AudioCapture::init()
             double omega = 2.0 * 3.14159265358979323846 * fc / fs;
             double sn = std::sin(omega);
             double cs = std::cos(omega);
-            double alpha = sn / (2.0 * 0.70710678118654752440); // Q = 0.707
+            double alpha = sn / (2.0 * 0.70710678118654752440);
 
             double a0 = 1.0 + alpha;
             m_bqMidB0 = alpha / a0;
@@ -132,7 +127,6 @@ bool AudioCapture::init()
         }
     }
     
-    // Initialize Biquad BPF coeffs for High band (8kHz center, Q=0.707 for wide band)
     {
         double fc = 8000.0;
         double fs = static_cast<double>(m_sampleRate);
@@ -140,7 +134,7 @@ bool AudioCapture::init()
             double omega = 2.0 * 3.14159265358979323846 * fc / fs;
             double sn = std::sin(omega);
             double cs = std::cos(omega);
-            double alpha = sn / (2.0 * 0.70710678118654752440); // Q = 0.707
+            double alpha = sn / (2.0 * 0.70710678118654752440);
 
             double a0 = 1.0 + alpha;
             m_bqHighB0 = alpha / a0;
@@ -151,7 +145,6 @@ bool AudioCapture::init()
         }
     }
 
-    // Initialize in loopback mode with low latency (20ms = 200,000 hns)
     REFERENCE_TIME hnsBuffer = 200000;
     hr = m_audioClient->Initialize(
         AUDCLNT_SHAREMODE_SHARED,
@@ -165,7 +158,6 @@ bool AudioCapture::init()
         return false;
     }
 
-    // Get capture client
     hr = m_audioClient->GetService(
         __uuidof(IAudioCaptureClient),
         reinterpret_cast<void**>(&m_captureClient));
@@ -174,7 +166,6 @@ bool AudioCapture::init()
         return false;
     }
 
-    // Start capturing
     hr = m_audioClient->Start();
     if (FAILED(hr)) {
         fprintf(stderr, "[AudioCapture] Failed to start capture: 0x%08lx\n", hr);
@@ -211,15 +202,11 @@ void AudioCapture::feedAudio(projectm_handle pm, float gain)
         if (FAILED(hr))
             break;
 
-        // Convert to float stereo and feed projectM.
-        // NOTE: Loopback is often >2ch (5.1/7.1) and/or PCM int16/24.
-        // Feeding it as float stereo directly causes "spotty"/incorrect reactivity.
         m_stereoBuffer.resize(static_cast<size_t>(numFrames) * 2);
 
         convertPacketToStereoFloat(data, numFrames, flags, gain);
         accumulateMetering(numFrames, sumSq, peak);
 
-        // Process beats per-packet (fixes potential OOB if multi-packet; original had latent bug)
         processMultiBandBeats(numFrames);
 
         sampleCount += numFrames;
@@ -230,7 +217,6 @@ void AudioCapture::feedAudio(projectm_handle pm, float gain)
         m_captureClient->ReleaseBuffer(numFrames);
     }
 
-    // Update smoothed meter values (kept simple in main flow)
     if (gotAny && sampleCount > 0) {
         float rms = static_cast<float>(std::sqrt(sumSq / static_cast<double>(sampleCount)));
         float a = (rms > m_levelRms) ? 0.35f : 0.08f;
@@ -241,9 +227,56 @@ void AudioCapture::feedAudio(projectm_handle pm, float gain)
     }
 }
 
-// --- Extracted helper methods (reduces feedAudio cognitive complexity from ~40+ to <10) ---
-// These follow the refactor skill: single responsibility, eliminate repeated biquad/onset code,
-// guard clauses, meaningful names. Enables easier portability (future backends can reuse beat logic).
+void AudioCapture::feedAudio(IVisualizer* viz, float gain)
+{
+    if (!m_initialized || !viz)
+        return;
+
+    HRESULT hr;
+    UINT32 packetSize;
+
+    double sumSq = 0.0;
+    float peak = 0.0f;
+    uint64_t sampleCount = 0;
+    bool gotAny = false;
+
+    for (hr = m_captureClient->GetNextPacketSize(&packetSize);
+         SUCCEEDED(hr) && packetSize > 0;
+         hr = m_captureClient->GetNextPacketSize(&packetSize))
+    {
+        BYTE*  data = nullptr;
+        UINT32 numFrames = 0;
+        DWORD  flags = 0;
+
+        hr = m_captureClient->GetBuffer(&data, &numFrames, &flags, nullptr, nullptr);
+        if (FAILED(hr))
+            break;
+
+        m_stereoBuffer.resize(static_cast<size_t>(numFrames) * 2);
+
+        convertPacketToStereoFloat(data, numFrames, flags, gain);
+        accumulateMetering(numFrames, sumSq, peak);
+
+        processMultiBandBeats(numFrames);
+
+        sampleCount += numFrames;
+        gotAny = true;
+
+        // Use the abstraction layer instead of direct projectM call
+        viz->addAudioPCM(m_stereoBuffer.data(), numFrames);
+
+        m_captureClient->ReleaseBuffer(numFrames);
+    }
+
+    if (gotAny && sampleCount > 0) {
+        float rms = static_cast<float>(std::sqrt(sumSq / static_cast<double>(sampleCount)));
+        float a = (rms > m_levelRms) ? 0.35f : 0.08f;
+        m_levelRms = m_levelRms + (rms - m_levelRms) * a;
+        m_levelPeak = (std::max)(m_levelPeak * 0.90f, peak);
+    } else {
+        decayLevels();
+    }
+}
 
 void AudioCapture::convertPacketToStereoFloat(const BYTE* data, UINT32 numFrames, DWORD flags, float gain)
 {
@@ -343,13 +376,11 @@ void AudioCapture::processMultiBandBeats(UINT32 numFrames)
     for (UINT32 i = 0; i < numFrames; i++) {
         float mono = 0.5f * (m_stereoBuffer[i * 2] + m_stereoBuffer[i * 2 + 1]);
 
-        // Single-pole LPF (broad bass)
         m_bassLpState += bassAlpha * (mono - m_bassLpState);
         bassAccum += std::fabs(m_bassLpState);
 
         double dMono = static_cast<double>(mono);
 
-        // Low, Mid, High bands via generic helper (eliminates 3x duplication)
         processBiquadBand(dMono, m_bqLowX1, m_bqLowX2, m_bqLowY1, m_bqLowY2,
                           m_bqLowB0, m_bqLowB1, m_bqLowB2, m_bqLowA1, m_bqLowA2,
                           beatLowPeak, 10.0f);
@@ -373,7 +404,6 @@ void AudioCapture::processMultiBandBeats(UINT32 numFrames)
 
 void AudioCapture::updateBeatLevels(float lowPeak, float midPeak, float highPeak)
 {
-    // Low band (kicks)
     {
         constexpr float safetyCeil = 6.0f;
         float level = (lowPeak > safetyCeil) ? safetyCeil : lowPeak;
@@ -381,14 +411,12 @@ void AudioCapture::updateBeatLevels(float lowPeak, float midPeak, float highPeak
         m_levelBeatLow = m_levelBeatLow + (level - m_levelBeatLow) * alpha;
         m_levelBeatBass = m_levelBeatLow;
     }
-    // Mid band (snares)
     {
         constexpr float safetyCeil = 4.0f;
         float level = (midPeak > safetyCeil) ? safetyCeil : midPeak;
         float alpha = (level > m_levelBeatMid) ? 0.5f : 0.3f;
         m_levelBeatMid = m_levelBeatMid + (level - m_levelBeatMid) * alpha;
     }
-    // High band (hi-hats)
     {
         constexpr float safetyCeil = 3.0f;
         float level = (highPeak > safetyCeil) ? safetyCeil : highPeak;
@@ -403,7 +431,6 @@ void AudioCapture::checkOnsets()
     if (m_cooldownMid > 0) m_cooldownMid--;
     if (m_cooldownHigh > 0) m_cooldownHigh--;
 
-    // Low onset
     {
         float flux = (std::max)(0.0f, m_levelBeatLow - m_avgShortLow);
         m_fluxLow = m_fluxLow * 0.8f + flux * 0.2f;
@@ -415,7 +442,6 @@ void AudioCapture::checkOnsets()
             m_cooldownLow = 8;
         }
     }
-    // Mid onset
     {
         float flux = (std::max)(0.0f, m_levelBeatMid - m_avgShortMid);
         m_fluxMid = m_fluxMid * 0.8f + flux * 0.2f;
@@ -427,7 +453,6 @@ void AudioCapture::checkOnsets()
             m_cooldownMid = 7;
         }
     }
-    // High onset
     {
         float flux = (std::max)(0.0f, m_levelBeatHigh - m_avgShortHigh);
         m_fluxHigh = m_fluxHigh * 0.75f + flux * 0.25f;

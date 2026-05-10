@@ -1,53 +1,6 @@
-/**
- * Vibeus - A custom music visualizer frontend powered by projectM
- *
- * Controls:
- *   N / Right       - Next preset
- *   P / Left        - Previous preset
- *   R               - Random preset (hard cut)
- *   H               - Go back in history
- *   S               - Toggle shuffle
- *   F / F11         - Toggle fullscreen
- *   Up/Down         - Adjust beat sensitivity
- *   D               - Toggle debug overlay
- *   I               - Toggle beat indicator (red circle flashes on beats)
- *   [ / ]           - Slow down / speed up visualization
- *   Backspace       - Reset speed to 1.0x
- *   - / =           - Audio reactivity down / up
- *   0               - Reset audio reactivity to 1.0x
- *   Mouse click     - Create touch waveform
- *   Mouse drag      - Move touch waveform
- *   Right-click     - Cycle waveform type
- *   Scroll wheel    - Adjust touch pressure
- *   Shift+Scroll    - Cycle waveform type
- *   C               - Clear all touch waveforms
- *   Tab             - Toggle flow mode (mouse controls speed + waveforms)
- *   Escape          - Pause menu (during viz) / Back (in menus)
- *   Q               - Quit
- *
- * Gamepad (if connected):
- *   Left stick      - Speed control (X) + waveform position (Y)
- *   Right stick     - Touch waveform creation & movement
- *   A / Cross       - Next preset
- *   B / Circle      - Previous preset
- *   X / Square      - Random preset
- *   Y / Triangle    - Toggle shuffle
- *   Start           - Pause menu
- *   LB / RB         - Audio gain down / up
- *   LT / RT         - Speed down / up (analog)
- *   D-Pad Up/Down   - Beat sensitivity
- */
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
-
-#include <SDL.h>
-#include <SDL_opengl.h>
-
-#include <projectM-4/projectM.h>
-#include <projectM-4/parameters.h>
-#include <projectM-4/playlist.h>
+#include "IVisualizer.h"
+#include "ProjectMVisualizer.h"
+#include "VibeusVisualizer.h"
 
 #include "audio_capture.h"
 #include "preset_manager.h"
@@ -64,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <vector>
+#include <memory>
 
 namespace fs = std::filesystem;
 
@@ -79,7 +33,8 @@ static constexpr float  BEAT_SENSITIVITY   = 1.0f;
 // ----- Globals -----
 static SDL_Window*   g_window   = nullptr;
 static SDL_GLContext  g_glCtx   = nullptr;
-static projectm_handle g_pm     = nullptr;
+// Replaced projectm_handle with abstraction layer
+static std::unique_ptr<IVisualizer> g_visualizer;
 static bool          g_running  = true;
 static bool          g_fullscreen = false;
 static bool          g_debug    = false;
@@ -88,7 +43,7 @@ static bool          g_inStasis = false;
 static AudioCapture  g_audio;
 static PresetManager g_presets;
 static MenuOverlay   g_menu;
-static PresetDatabase g_presetDb;   // category-aware preset index (for browser)
+static PresetDatabase g_presetDb;
 Storyteller g_storyteller;
 
 // Configuration (persisted to JSON)
@@ -99,44 +54,34 @@ static std::string   g_favoritesPath;
 static std::string   g_brokenPresetBlacklistPath;
 static std::string   g_userBlacklistPath;
 
-// App state machine: Splash → MainMenu → Visualizer (with pause overlay)
 enum class AppState { Splash, MainMenu, Visualizer };
 static AppState g_appState = AppState::Splash;
 
-// Pause state
 static bool          g_paused    = false;
 static double        g_pausedTime = 0.0;
 static int           g_pauseRenderCount = 0;
 
-// Global state for beat indicator
 static bool          g_showBeatIndicator = false;
 static float         g_beatIndicatorAlpha = 0.0f;
 
-// Debug stats
 static Uint32 g_frameCount  = 0;
 static Uint32 g_fpsTimer    = 0;
 static float  g_currentFps  = 0.0f;
 
-// Speed control - always uses virtual clock for consistent pause/resume
-static double g_speedMultiplier = 1.0;    // 0.05x to 4.0x
-static double g_virtualTime     = 0.0;    // accumulated virtual seconds
+static double g_speedMultiplier = 1.0;
+static double g_virtualTime     = 0.0;
 static Uint32 g_lastFrameTicks  = 0;
 
-// Audio dampening - scales PCM amplitude before feeding to projectM
-static float  g_audioGain       = 1.0f;   // 0.0 (muted) to 3.0 (boosted)
+static float  g_audioGain       = 1.0f;
 
-// Accessibility flags (applied at runtime, synced from config)
-static bool   g_flashLimiter    = false;  // caps audio gain and beat sensitivity to reduce flashing
-static bool   g_reducedMotion   = false;  // applies 0.5x factor to animation speed
+static bool   g_flashLimiter    = false;
+static bool   g_reducedMotion   = false;
 
-// Forward declaration for centralized beat sensitivity helper (defined later, before applyConfig)
 static void setBeatSensitivity(float value, const char* reason);
 
-
-// Mouse / touch waveform state
 static bool   g_mouseDown       = false;
-static int    g_touchPressure   = 1;      // 0 to 2 (low / medium / high)
-static int    g_touchTypeIndex  = 0;      // index into touch type list
+static int    g_touchPressure   = 1;
+static int    g_touchTypeIndex  = 0;
 static constexpr projectm_touch_type g_touchTypes[] = {
     PROJECTM_TOUCH_TYPE_RANDOM,
     PROJECTM_TOUCH_TYPE_CIRCLE,
@@ -150,30 +95,22 @@ static constexpr projectm_touch_type g_touchTypes[] = {
 };
 static constexpr int g_touchTypeCount = sizeof(g_touchTypes) / sizeof(g_touchTypes[0]);
 
-// Gamepad
 static SDL_GameController* g_gamepad = nullptr;
-// Deadzone now configurable via settings (removed hardcoded constant)
 
-// Flow mode: mouse position controls speed + creates waveforms
 static bool  g_flowMode = false;
 
-// ----- Cursor Ripple Physics -----
-// On click, spawn an expanding ring of touch points that radiate outward.
-// On drag, velocity-based perpendicular spread creates trail effects.
-
 struct Ripple {
-    float cx, cy;           // center (normalized 0..1)
-    Uint32 startMs;         // spawn time
-    float durationSec;      // total lifetime
-    int   ringCount;        // how many rings to spawn
-    int   pointsPerRing;    // touch points per ring
-    float maxRadius;        // max spread in normalized coords
+    float cx, cy;
+    Uint32 startMs;
+    float durationSec;
+    int   ringCount;
+    int   pointsPerRing;
+    float maxRadius;
     projectm_touch_type type;
 };
 
 static std::vector<Ripple> g_ripples;
 
-// Previous mouse position for velocity calculation
 static int    g_prevMouseX = 0, g_prevMouseY = 0;
 static Uint32 g_prevMouseMs = 0;
 
@@ -204,11 +141,10 @@ static void processRipples()
             continue;
         }
 
-        float progress = elapsed / it->durationSec; // 0..1
+        float progress = elapsed / it->durationSec;
         int currentRing = static_cast<int>(progress * it->ringCount);
 
-        // Spawn new ring points at current expansion radius
-        static int lastRing[64] = {}; // track last spawned ring per ripple
+        static int lastRing[64] = {};
         size_t idx = static_cast<size_t>(it - g_ripples.begin());
         if (idx < 64 && currentRing > lastRing[idx]) {
             lastRing[idx] = currentRing;
@@ -220,9 +156,11 @@ static void processRipples()
                 float angle = (2.0f * 3.14159265f * i) / it->pointsPerRing;
                 float px = it->cx + cosf(angle) * radius;
                 float py = it->cy + sinf(angle) * radius;
-                // Clamp to screen
                 if (px >= 0.0f && px <= 1.0f && py >= 0.0f && py <= 1.0f)
-                    projectm_touch(g_pm, px, py, pressure, it->type);
+                    // Use abstraction if available
+                    if (auto* pmViz = dynamic_cast<ProjectMVisualizer*>(g_visualizer.get())) {
+                        projectm_touch(pmViz->getHandle(), px, py, pressure, it->type);
+                    }
             }
         }
         ++it;
@@ -237,20 +175,18 @@ static void processVelocityTrail(int mx, int my)
 
     float dx = static_cast<float>(mx - g_prevMouseX);
     float dy = static_cast<float>(my - g_prevMouseY);
-    float speed = sqrtf(dx * dx + dy * dy) / dt; // pixels/sec
+    float speed = sqrtf(dx * dx + dy * dy) / dt;
 
     g_prevMouseX = mx;
     g_prevMouseY = my;
     g_prevMouseMs = now;
 
-    if (speed < 50.0f) return; // below threshold — no trail
+    if (speed < 50.0f) return;
 
-    // Normalize velocity direction
     float len = sqrtf(dx * dx + dy * dy);
     if (len < 1.0f) return;
     float ndx = dx / len, ndy = dy / len;
 
-    // Perpendicular direction for spread
     float px = -ndy, py = ndx;
 
     int w, h;
@@ -258,18 +194,19 @@ static void processVelocityTrail(int mx, int my)
     float cnx = static_cast<float>(mx) / w;
     float cny = static_cast<float>(my) / h;
 
-    // Spread proportional to speed (capped)
     float spread = fminf(speed / 2000.0f, 0.08f);
     int trailPoints = (speed > 400.0f) ? 4 : 2;
     int pressure = (speed > 800.0f) ? 2 : 1;
 
     for (int i = -trailPoints; i <= trailPoints; i++) {
-        if (i == 0) continue; // center handled by normal drag
+        if (i == 0) continue;
         float offset = spread * (static_cast<float>(i) / trailPoints);
         float tx = cnx + px * offset;
         float ty = cny + py * offset;
         if (tx >= 0.0f && tx <= 1.0f && ty >= 0.0f && ty <= 1.0f)
-            projectm_touch(g_pm, tx, ty, pressure, g_touchTypes[g_touchTypeIndex]);
+            if (auto* pmViz = dynamic_cast<ProjectMVisualizer*>(g_visualizer.get())) {
+                projectm_touch(pmViz->getHandle(), tx, ty, pressure, g_touchTypes[g_touchTypeIndex]);
+            }
     }
 }
 
@@ -289,8 +226,6 @@ static const char* touchTypeName(projectm_touch_type t)
     }
 }
 
-// ----- Debug -----
-
 static const char* logLevelStr(projectm_log_level level)
 {
     switch (level) {
@@ -304,11 +239,7 @@ static const char* logLevelStr(projectm_log_level level)
     }
 }
 
-// Global flag to track if current preset has compilation/runtime load errors
 bool g_lastPresetHadError = false;
-
-// When true, any projectM ERROR log will mark the current preset as broken.
-// This is enabled during preset validation scans.
 bool g_captureProjectMErrors = false;
 FILE* g_validationLogFile = nullptr;
 
@@ -320,8 +251,6 @@ static void projectmLogCallback(const char* message, projectm_log_level level, v
         fflush(g_validationLogFile);
     }
     
-    // During validation scans, treat ANY ERROR as a broken preset.
-    // This catches shader compile errors *and* per-frame/per-pixel compile failures.
     if (g_captureProjectMErrors && level == PROJECTM_LOG_LEVEL_ERROR) {
         g_lastPresetHadError = true;
     }
@@ -331,7 +260,6 @@ static void updateDebugTitle()
 {
     if (!g_debug && !g_config.storyDebug) return;
     std::string preset = g_presets.currentPresetName();
-    // Extract just the filename
     auto pos = preset.find_last_of("/\\");
     if (pos != std::string::npos)
         preset = preset.substr(pos + 1);
@@ -362,8 +290,6 @@ static void updateDebugTitle()
     SDL_SetWindowTitle(g_window, title);
 }
 
-// ----- Speed Control -----
-
 static void adjustSpeed(double delta)
 {
     g_speedMultiplier += delta;
@@ -382,21 +308,18 @@ static void updateVirtualTime(Uint32 nowTicks)
 {
     double realDelta = (nowTicks - g_lastFrameTicks) / 1000.0;
     g_lastFrameTicks = nowTicks;
-    // Cap delta to prevent jumps (e.g. after resume or stall)
     if (realDelta > 0.1) realDelta = 0.1;
     double effectiveSpeed = g_speedMultiplier * (g_reducedMotion ? 0.5 : 1.0);
     if (effectiveSpeed < 0.05) effectiveSpeed = 0.05;
     g_virtualTime += realDelta * effectiveSpeed;
-    projectm_set_frame_time(g_pm, g_virtualTime);
+    if (g_visualizer) g_visualizer->setFrameTime(g_virtualTime);
 }
-
-// ----- Pause -----
 
 static void enterPause()
 {
     g_paused = true;
     g_pausedTime = g_virtualTime;
-    g_pauseRenderCount = 0; // reset so we render a few frozen frames
+    g_pauseRenderCount = 0;
     g_menu.showScreen(UIScreen::PauseMenu);
     fprintf(stderr, "[Vibeus] Paused at virtual time %.3f\n", g_pausedTime);
 }
@@ -409,8 +332,6 @@ static void resumeFromPause()
     g_lastFrameTicks = SDL_GetTicks();
     fprintf(stderr, "[Vibeus] Resumed\n");
 }
-
-// ----- Audio Gain -----
 
 static void adjustAudioGain(float delta)
 {
@@ -426,8 +347,6 @@ static void resetAudioGain()
     fprintf(stderr, "[Vibeus] Audio gain reset to 100%%\n");
 }
 
-// ----- Mouse → Touch -----
-
 static void screenToNormalized(int sx, int sy, float& nx, float& ny)
 {
     int w, h;
@@ -436,11 +355,9 @@ static void screenToNormalized(int sx, int sy, float& nx, float& ny)
     ny = static_cast<float>(sy) / static_cast<float>(h);
 }
 
-// ----- Gamepad -----
-
 static void tryOpenGamepad()
 {
-    if (g_gamepad) return; // already have one
+    if (g_gamepad) return;
     for (int i = 0; i < SDL_NumJoysticks(); i++) {
         if (SDL_IsGameController(i)) {
             g_gamepad = SDL_GameControllerOpen(i);
@@ -457,7 +374,7 @@ static float stickAxis(SDL_GameControllerAxis axis)
 {
     if (!g_gamepad) return 0.0f;
     int raw = SDL_GameControllerGetAxis(g_gamepad, axis);
-    if (abs(raw) < g_config.gamepadDeadzone) return 0.0f;  // Use config value
+    if (abs(raw) < g_config.gamepadDeadzone) return 0.0f;
     return static_cast<float>(raw) / 32768.0f;
 }
 
@@ -466,32 +383,29 @@ static void processGamepad()
     if (!g_gamepad) return;
     if (g_paused || g_appState != AppState::Visualizer) return;
 
-    // Left trigger = slow down, Right trigger = speed up (analog)
     float lt = static_cast<float>(SDL_GameControllerGetAxis(g_gamepad, SDL_CONTROLLER_AXIS_TRIGGERLEFT)) / 32768.0f;
     float rt = static_cast<float>(SDL_GameControllerGetAxis(g_gamepad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT)) / 32768.0f;
     if (lt > 0.1f || rt > 0.1f) {
-        // Map triggers: LT slows (toward 0.1x), RT speeds (toward 4x)
         double targetSpeed = 1.0 + (rt - lt) * 1.5;
-        // Smoothly interpolate toward target
         g_speedMultiplier += (targetSpeed - g_speedMultiplier) * 0.08;
         if (g_speedMultiplier < 0.05) g_speedMultiplier = 0.05;
         if (g_speedMultiplier > 4.0)  g_speedMultiplier = 4.0;
     }
 
-    // Right stick = touch waveform control [DISABLED]
     if (false && g_config.touchEnabled) {
         float rx = stickAxis(SDL_CONTROLLER_AXIS_RIGHTX);
         float ry = stickAxis(SDL_CONTROLLER_AXIS_RIGHTY);
         if (fabsf(rx) > 0.0f || fabsf(ry) > 0.0f) {
-            float nx = 0.5f + rx * 0.5f;  // map -1..1 to 0..1
+            float nx = 0.5f + rx * 0.5f;
             float ny = 0.5f + ry * 0.5f;
             float magnitude = sqrtf(rx * rx + ry * ry);
             int pressure = (magnitude > 0.7f) ? 2 : (magnitude > 0.3f) ? 1 : 0;
-            projectm_touch(g_pm, nx, ny, pressure, g_touchTypes[g_touchTypeIndex]);
+            if (auto* pmViz = dynamic_cast<ProjectMVisualizer*>(g_visualizer.get())) {
+                projectm_touch(pmViz->getHandle(), nx, ny, pressure, g_touchTypes[g_touchTypeIndex]);
+            }
         }
     }
 
-    // Left stick X = fine speed adjustment
     float lx = stickAxis(SDL_CONTROLLER_AXIS_LEFTX);
     if (fabsf(lx) > 0.0f) {
         g_speedMultiplier += lx * 0.02;
@@ -499,8 +413,6 @@ static void processGamepad()
         if (g_speedMultiplier > 4.0)  g_speedMultiplier = 4.0;
     }
 }
-
-// ----- Flow Mode ----- [DISABLED]
 
 static void processFlowMode()
 {
@@ -511,27 +423,25 @@ static void processFlowMode()
     int w, h;
     SDL_GetWindowSize(g_window, &w, &h);
 
-    // Normalized mouse position: 0..1
     float nx = static_cast<float>(mx) / static_cast<float>(w);
     float ny = static_cast<float>(my) / static_cast<float>(h);
 
-    // Horizontal position maps to speed: left=0.2x, center=1.0x, right=3.0x
     double targetSpeed = 0.2 + nx * 2.8;
     g_speedMultiplier += (targetSpeed - g_speedMultiplier) * 0.05;
     if (g_speedMultiplier < 0.05) g_speedMultiplier = 0.05;
     if (g_speedMultiplier > 4.0)  g_speedMultiplier = 4.0;
 
-    // Vertical position creates subtle waveforms at mouse location
-    // Lower = more waveforms (every N frames)
-    int interval = static_cast<int>(15.0f - ny * 12.0f); // top=15 frames, bottom=3 frames
+    int interval = static_cast<int>(15.0f - ny * 12.0f);
     if (interval < 2) interval = 2;
     static int flowFrameCount = 0;
     flowFrameCount++;
     if (flowFrameCount >= interval) {
         flowFrameCount = 0;
-        int pressure = static_cast<int>(ny * 2.0f); // top=0, bottom=2
+        int pressure = static_cast<int>(ny * 2.0f);
         if (pressure > 2) pressure = 2;
-        projectm_touch(g_pm, nx, ny, pressure, g_touchTypes[g_touchTypeIndex]);
+        if (auto* pmViz = dynamic_cast<ProjectMVisualizer*>(g_visualizer.get())) {
+            projectm_touch(pmViz->getHandle(), nx, ny, pressure, g_touchTypes[g_touchTypeIndex]);
+        }
     }
 }
 
@@ -546,12 +456,8 @@ static void attachConsole()
 }
 #endif
 
-// ----- Helpers -----
-
 static std::string getUserDataDir()
 {
-    // SDL_GetPrefPath returns a per-user writable directory and creates it if needed.
-    // This avoids crashes when installed under Program Files.
     char* p = SDL_GetPrefPath("VibeusProject", "Vibeus");
     if (!p) {
         const char* b = SDL_GetBasePath();
@@ -564,7 +470,6 @@ static std::string getUserDataDir()
 
 static std::string findPresetsDir()
 {
-    // Check common locations relative to the executable
     const char* base = SDL_GetBasePath();
     auto exePath = fs::path(base ? base : "");
     std::string candidates[] = {
@@ -577,7 +482,7 @@ static std::string findPresetsDir()
         if (fs::exists(path) && fs::is_directory(path))
             return path;
     }
-    return "presets"; // fallback
+    return "presets";
 }
 
 static bool initSDL()
@@ -587,7 +492,6 @@ static bool initSDL()
         return false;
     }
 
-    // Request OpenGL 3.3 Core
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
@@ -610,40 +514,27 @@ static bool initSDL()
     }
 
     SDL_GL_MakeCurrent(g_window, g_glCtx);
-    SDL_GL_SetSwapInterval(1); // vsync
+    SDL_GL_SetSwapInterval(1);
 
     return true;
 }
 
-static bool initProjectM()
+// Updated init to use abstraction layer
+static bool initVisualizer()
 {
-    g_pm = projectm_create();
-    if (!g_pm) {
-        fprintf(stderr, "[Vibeus] projectm_create() failed - check OpenGL context\n");
+    // Default to ProjectM for full compatibility
+    // To use custom backend: g_visualizer = std::make_unique<VibeusVisualizer>();
+    g_visualizer = std::make_unique<ProjectMVisualizer>();
+    
+    if (!g_visualizer->initialize(DEFAULT_WIDTH, DEFAULT_HEIGHT)) {
+        fprintf(stderr, "[Vibeus] Visualizer initialization failed\n");
         return false;
     }
 
-    // Print version
-    int major, minor, patch;
-    projectm_get_version_components(&major, &minor, &patch);
-    fprintf(stderr, "[Vibeus] projectM %d.%d.%d initialized\n", major, minor, patch);
+    fprintf(stderr, "[Vibeus] %s initialized\n", g_visualizer->getBackendInfo().c_str());
 
-    // NOTE: Initialization uses some hardcoded defaults for first frame.
-    // Long-term goal (Phase 1): move all configurable values into applyConfig(g_config)
-    // so that restart + settings changes are always consistent.
-    // Configure
-    projectm_set_window_size(g_pm, DEFAULT_WIDTH, DEFAULT_HEIGHT);
-    projectm_set_preset_duration(g_pm, PRESET_DURATION);
-    projectm_set_soft_cut_duration(g_pm, SOFT_CUT_DURATION);
-    projectm_set_hard_cut_duration(g_pm, HARD_CUT_DURATION);
-    projectm_set_hard_cut_enabled(g_pm, true);
-    setBeatSensitivity(BEAT_SENSITIVITY, "init");
-    projectm_set_mesh_size(g_pm, 64, 48); // higher res per-pixel mesh for better warp
-
-    // Set texture search paths (for preset textures)
     std::string presetsDir = findPresetsDir();
 
-    // Load the rich category database (used by the preset browser UI)
     uint32_t dbCount = g_presetDb.loadFromDirectory(presetsDir);
     fprintf(stderr, "[Vibeus] PresetDatabase loaded %u presets across %zu categories\n",
             dbCount, g_presetDb.categoryCount());
@@ -652,13 +543,11 @@ static bool initProjectM()
     auto exeDir = fs::path(base ? base : "");
     std::string texturesDir = (exeDir / "textures").string();
 
-    // Search both a dedicated textures folder and the presets folder
     std::vector<const char*> texPaths;
     if (fs::exists(texturesDir) && fs::is_directory(texturesDir))
         texPaths.push_back(texturesDir.c_str());
     texPaths.push_back(presetsDir.c_str());
-    projectm_set_texture_search_paths(g_pm, texPaths.data(),
-                                      static_cast<size_t>(texPaths.size()));
+    g_visualizer->setTextureSearchPaths(texPaths.data(), texPaths.size());
 
     return true;
 }
@@ -671,7 +560,7 @@ static void toggleFullscreen()
 
     int w, h;
     SDL_GetWindowSize(g_window, &w, &h);
-    projectm_set_window_size(g_pm, w, h);
+    if (g_visualizer) g_visualizer->setWindowSize(w, h);
     fprintf(stderr, "[Vibeus] %s (%dx%d)\n",
             g_fullscreen ? "Fullscreen" : "Windowed", w, h);
 }
@@ -705,7 +594,6 @@ static void handleKeyDown(SDL_Keysym key)
         return;
     }
 
-    // Preset navigation
     if (sym == g_config.keyNextPreset || sym == SDLK_RIGHT) {
         g_presets.next(false);
         toastInput("Next preset");
@@ -717,7 +605,7 @@ static void handleKeyDown(SDL_Keysym key)
         return;
     }
     if (sym == g_config.keyRandomPreset) {
-        g_presets.next(true); // hard cut = random jump
+        g_presets.next(true);
         toastInput("Random preset");
         return;
     }
@@ -732,7 +620,6 @@ static void handleKeyDown(SDL_Keysym key)
         return;
     }
 
-    // Blacklist current preset (B key)
     if (sym == SDLK_b) {
         std::string removed = g_presets.blacklistCurrent(g_userBlacklistPath);
         if (!removed.empty()) {
@@ -741,7 +628,6 @@ static void handleKeyDown(SDL_Keysym key)
         return;
     }
 
-    // Toggle favorite on current preset (F key) - quick access without menu
     if (sym == SDLK_f) {
         uint32_t currentIdx = g_presets.position();
         g_menu.toggleFavorite(currentIdx);
@@ -750,18 +636,14 @@ static void handleKeyDown(SDL_Keysym key)
         return;
     }
 
-    // Quarantine current preset (black screen / broken) - Q key
     if (sym == SDLK_q) {
         std::string removed = g_presets.blacklistCurrent(g_userBlacklistPath);
         if (!removed.empty()) {
             toastInput(("Quarantined (black screen): " + removed).c_str());
-            // Also try to add to the preset database quarantine if available
-            // (the database already has a quarantine list in some builds)
         }
         return;
     }
 
-    // Debug display
     if (sym == g_config.keyDebug) {
         g_debug = !g_debug;
         if (!g_debug && !g_config.storyDebug)
@@ -773,7 +655,6 @@ static void handleKeyDown(SDL_Keysym key)
         return;
     }
 
-    // Storyteller Telemetry Toggle (L key)
     if (sym == SDLK_l) {
         g_config.storyDebug = !g_config.storyDebug;
         if (!g_debug && !g_config.storyDebug)
@@ -785,14 +666,12 @@ static void handleKeyDown(SDL_Keysym key)
         return;
     }
 
-    // Beat indicator toggle
-    if (sym == SDLK_i) { // Changed to I because B is used for Blacklist
+    if (sym == SDLK_i) {
         g_showBeatIndicator = !g_showBeatIndicator;
         toastInput(g_showBeatIndicator ? "Beat Indicator ON" : "Beat Indicator OFF");
         return;
     }
 
-    // Speed control
     if (sym == g_config.keySpeedDown) {
         adjustSpeed(-0.05);
         char buf[64];
@@ -813,7 +692,6 @@ static void handleKeyDown(SDL_Keysym key)
         return;
     }
 
-    // Audio gain
     if (sym == g_config.keyAudioGainDown) {
         adjustAudioGain(-0.1f);
         char buf[64];
@@ -834,14 +712,12 @@ static void handleKeyDown(SDL_Keysym key)
         return;
     }
 
-    // Fullscreen
     if (sym == g_config.keyFullscreen || sym == SDLK_F11) {
         toggleFullscreen();
         toastInput(g_fullscreen ? "Fullscreen" : "Windowed");
         return;
     }
 
-    // F1 — show Controls tab (standard help-key convention)
     if (sym == SDLK_F1) {
         if (g_appState == AppState::Visualizer && g_paused)
             g_menu.setSettingsReturnScreen(UIScreen::PauseMenu);
@@ -850,13 +726,12 @@ static void handleKeyDown(SDL_Keysym key)
         g_menu.jumpToSettingsTab(4);
         g_menu.showScreen(UIScreen::Settings);
         if (g_appState == AppState::Visualizer && !g_paused)
-            g_paused = true; // pause so the overlay is interactive
+            g_paused = true;
         return;
     }
 
-    // Beat sensitivity
     if (sym == g_config.keyBeatSensUp) {
-        float sens = projectm_get_beat_sensitivity(g_pm);
+        float sens = g_visualizer ? g_visualizer->getBeatSensitivity() : 1.0f;
         sens = (sens < 4.9f) ? sens + 0.1f : 5.0f;
         setBeatSensitivity(sens, "key");
         fprintf(stderr, "[Vibeus] Beat sensitivity: %.1f\n", sens);
@@ -867,7 +742,7 @@ static void handleKeyDown(SDL_Keysym key)
     }
 
     if (sym == g_config.keyBeatSensDown) {
-        float sens = projectm_get_beat_sensitivity(g_pm);
+        float sens = g_visualizer ? g_visualizer->getBeatSensitivity() : 1.0f;
         sens = (sens > 0.1f) ? sens - 0.1f : 0.0f;
         setBeatSensitivity(sens, "key");
         fprintf(stderr, "[Vibeus] Beat sensitivity: %.1f\n", sens);
@@ -887,17 +762,14 @@ static void processEvents()
         g_lastPresetHadError = false;
     }
     while (SDL_PollEvent(&event)) {
-        // Only forward events to ImGui when UI is visible
         if (g_menu.isVisible())
             g_menu.processEvent(event);
 
-        // Always handle window close
         if (event.type == SDL_QUIT) {
             g_running = false;
             continue;
         }
 
-        // Gamepad hotplug
         if (event.type == SDL_CONTROLLERDEVICEADDED) {
             tryOpenGamepad();
             continue;
@@ -911,15 +783,9 @@ static void processEvents()
             continue;
         }
 
-        // --- State-specific input handling ---
-
-        // During splash/main menu, all input goes to the UI
         if (g_appState == AppState::Splash || g_appState == AppState::MainMenu)
             continue;
 
-        // In visualizer state:
-
-        // ESC toggles pause menu
         if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
             if (g_paused) {
                 resumeFromPause();
@@ -931,7 +797,6 @@ static void processEvents()
             continue;
         }
 
-        // Gamepad Start = pause menu
         if (event.type == SDL_CONTROLLERBUTTONDOWN &&
             event.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
             if (g_paused) {
@@ -944,14 +809,11 @@ static void processEvents()
             continue;
         }
 
-        // When paused/in browser, suppress normal visualizer input
         if (g_paused) continue;
 
-        // Gamepad buttons (during active visualization)
         if (event.type == SDL_CONTROLLERBUTTONDOWN) {
             const int btn = event.cbutton.button;
 
-            // Configurable buttons
             if (btn == g_config.gpNextPreset) {
                 g_presets.next(false);
                 toastInput("Next preset");
@@ -963,7 +825,7 @@ static void processEvents()
                 continue;
             }
             if (btn == g_config.gpRandomPreset) {
-                g_presets.next(true); // hard cut
+                g_presets.next(true);
                 toastInput("Random preset");
                 continue;
             }
@@ -987,10 +849,9 @@ static void processEvents()
                 continue;
             }
 
-            // Fixed buttons
             switch (btn) {
             case SDL_CONTROLLER_BUTTON_DPAD_UP: {
-                float sens = projectm_get_beat_sensitivity(g_pm);
+                float sens = g_visualizer ? g_visualizer->getBeatSensitivity() : 1.0f;
                 sens = (sens < 4.9f) ? sens + 0.2f : 5.0f;
                 setBeatSensitivity(sens, "key");
                 fprintf(stderr, "[Vibeus] Beat sensitivity: %.1f\n", sens);
@@ -1000,7 +861,7 @@ static void processEvents()
                 break;
             }
             case SDL_CONTROLLER_BUTTON_DPAD_DOWN: {
-                float sens = projectm_get_beat_sensitivity(g_pm);
+                float sens = g_visualizer ? g_visualizer->getBeatSensitivity() : 1.0f;
                 sens = (sens > 0.2f) ? sens - 0.2f : 0.0f;
                 setBeatSensitivity(sens, "key");
                 fprintf(stderr, "[Vibeus] Beat sensitivity: %.1f\n", sens);
@@ -1021,30 +882,30 @@ static void processEvents()
             break;
 
         case SDL_MOUSEBUTTONDOWN:
-            if (false && g_config.touchEnabled && event.button.button == SDL_BUTTON_LEFT) {  // [DISABLED]
+            if (false && g_config.touchEnabled && event.button.button == SDL_BUTTON_LEFT) {
                 g_mouseDown = true;
                 float nx, ny;
                 screenToNormalized(event.button.x, event.button.y, nx, ny);
-                projectm_touch(g_pm, nx, ny, g_touchPressure, g_touchTypes[g_touchTypeIndex]);
-                // Spawn expanding ripple ring from click point
+                if (auto* pmViz = dynamic_cast<ProjectMVisualizer*>(g_visualizer.get())) {
+                    projectm_touch(pmViz->getHandle(), nx, ny, g_touchPressure, g_touchTypes[g_touchTypeIndex]);
+                }
                 spawnRipple(nx, ny);
-                // Init velocity tracking
                 g_prevMouseX  = event.button.x;
                 g_prevMouseY  = event.button.y;
                 g_prevMouseMs = SDL_GetTicks();
-            } else if (false && g_config.touchEnabled && event.button.button == SDL_BUTTON_RIGHT) {  // [DISABLED]
-                // Cycle touch waveform type
+            } else if (false && g_config.touchEnabled && event.button.button == SDL_BUTTON_RIGHT) {
                 g_touchTypeIndex = (g_touchTypeIndex + 1) % g_touchTypeCount;
                 fprintf(stderr, "[Vibeus] Touch type: %s\n", touchTypeName(g_touchTypes[g_touchTypeIndex]));
             }
             break;
 
         case SDL_MOUSEMOTION:
-            if (false && g_config.touchEnabled && g_mouseDown) {  // [DISABLED]
+            if (false && g_config.touchEnabled && g_mouseDown) {
                 float nx, ny;
                 screenToNormalized(event.motion.x, event.motion.y, nx, ny);
-                projectm_touch_drag(g_pm, nx, ny, g_touchPressure);
-                // Velocity-based perpendicular trail spread
+                if (auto* pmViz = dynamic_cast<ProjectMVisualizer*>(g_visualizer.get())) {
+                    projectm_touch_drag(pmViz->getHandle(), nx, ny, g_touchPressure);
+                }
                 processVelocityTrail(event.motion.x, event.motion.y);
             }
             break;
@@ -1052,20 +913,17 @@ static void processEvents()
         case SDL_MOUSEBUTTONUP:
             if (event.button.button == SDL_BUTTON_LEFT) {
                 g_mouseDown = false;
-                // Waveforms persist — use C key or right-click to manage
             }
             break;
 
         case SDL_MOUSEWHEEL:
-            if (false && g_config.touchEnabled && (SDL_GetModState() & KMOD_SHIFT)) {  // [DISABLED]
-                // Shift+scroll = cycle touch type
+            if (false && g_config.touchEnabled && (SDL_GetModState() & KMOD_SHIFT)) {
                 if (event.wheel.y > 0)
                     g_touchTypeIndex = (g_touchTypeIndex + 1) % g_touchTypeCount;
                 else if (event.wheel.y < 0)
                     g_touchTypeIndex = (g_touchTypeIndex - 1 + g_touchTypeCount) % g_touchTypeCount;
                 fprintf(stderr, "[Vibeus] Touch type: %s\n", touchTypeName(g_touchTypes[g_touchTypeIndex]));
-            } else if (false) {  // [DISABLED]
-                // Scroll = adjust touch pressure (0–2)
+            } else if (false) {
                 int prevPressure = g_touchPressure;
                 g_touchPressure += (event.wheel.y > 0) ? 1 : -1;
                 if (g_touchPressure < 0) g_touchPressure = 0;
@@ -1080,7 +938,7 @@ static void processEvents()
                 event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
                 int w = event.window.data1;
                 int h = event.window.data2;
-                projectm_set_window_size(g_pm, w, h);
+                if (g_visualizer) g_visualizer->setWindowSize(w, h);
             }
             break;
 
@@ -1090,19 +948,10 @@ static void processEvents()
     }
 }
 
-// ----- Apply Configuration -----
-
-// ----- Centralized Beat Sensitivity Setter (Phase 1 Governance) -----
-// This is the ONLY function allowed to call projectm_set_beat_sensitivity()
-// outside of the storyteller's internal update loop.
-// All other call sites (init, applyConfig, stasis, safety clamps) must
-// go through this helper so we have a single audit log.
 static void setBeatSensitivity(float value, const char* reason)
 {
-    if (!g_pm) return;
+    if (!g_visualizer) return;
 
-    // Hard safety clamp (never allow runaway > 3.0). Stasis is the only path
-    // allowed to force exact zero so silence can truly suppress beat reactivity.
     const bool stasisReason = reason && std::strcmp(reason, "stasis") == 0;
     const float minValue = stasisReason ? 0.0f : 0.1f;
     float clamped = (std::max)(minValue, (std::min)(3.0f, value));
@@ -1110,7 +959,7 @@ static void setBeatSensitivity(float value, const char* reason)
         fprintf(stderr, "[Beat] Clamped sensitivity %.2f -> %.2f (%s)\n", value, clamped, reason);
     }
 
-    projectm_set_beat_sensitivity(g_pm, clamped);
+    g_visualizer->setBeatSensitivity(clamped);
 
     static float lastLoggedValue = -1.0f;
     static std::string lastLoggedReason;
@@ -1125,47 +974,35 @@ static void setBeatSensitivity(float value, const char* reason)
 
 static void applyConfig(const VibeusConfig& cfg)
 {
-    // Phase 1 Hardening: Single source of truth for all settings
-    // All projectM + SDL side-effects for mesh, aspect, perfMode, easterEgg, etc.
-    // must go through this function (except storyteller beat sensitivity).
-    // Audio
     g_audioGain = cfg.audioGain;
-    if (g_pm) {
-        // Flash limiter caps beat sensitivity to reduce rapid brightness spikes
+    if (g_visualizer) {
         float effectiveSensitivity = cfg.flashLimiter
             ? (cfg.beatSensitivity < 1.5f ? cfg.beatSensitivity : 1.5f)
             : cfg.beatSensitivity;
         setBeatSensitivity(effectiveSensitivity, "applyConfig");
 
-        // Presets
-        projectm_set_preset_duration(g_pm, cfg.presetDuration);
-        projectm_set_soft_cut_duration(g_pm, cfg.transitionTime);
-        projectm_set_hard_cut_enabled(g_pm, cfg.autoAdvance && cfg.hardCutEnabled);
-        projectm_set_hard_cut_sensitivity(g_pm, cfg.hardCutSensitivity);
-        projectm_set_hard_cut_duration(g_pm, cfg.hardCutDuration);
-        projectm_set_easter_egg(g_pm, cfg.easterEgg);  // Preset variety
+        g_visualizer->setPresetDuration(cfg.presetDuration);
+        g_visualizer->setSoftCutDuration(cfg.transitionTime);
+        g_visualizer->setHardCutEnabled(cfg.autoAdvance && cfg.hardCutEnabled);
+        g_visualizer->setHardCutSensitivity(cfg.hardCutSensitivity);
+        g_visualizer->setHardCutDuration(cfg.hardCutDuration);
+        g_visualizer->setEasterEgg(cfg.easterEgg);
 
-        // Visual Quality
-        projectm_set_aspect_correction(g_pm, cfg.aspectCorrection);  // Fix ultrawide stretching
+        g_visualizer->setAspectCorrection(cfg.aspectCorrection);
         
-        // Mesh detail (separate from perfMode for fine control)
         int meshW = static_cast<int>(cfg.meshDetail);
-        int meshH = meshW * 3 / 4;  // Maintain 4:3 aspect ratio
-        projectm_set_mesh_size(g_pm, meshW, meshH);
+        int meshH = meshW * 3 / 4;
+        g_visualizer->setMeshSize(meshW, meshH);
 
-        // Lock preset when autoAdvance is off or vibeLock is active
-        projectm_set_preset_locked(g_pm, !cfg.autoAdvance || cfg.vibeLock);
+        g_visualizer->setPresetLocked(!cfg.autoAdvance || cfg.vibeLock);
     }
 
-    // Accessibility
     g_flashLimiter   = cfg.flashLimiter;
     g_reducedMotion  = cfg.reducedMotion;
 
-    // Shuffle
     if (cfg.shuffle != g_presets.isShuffled())
         g_presets.toggleShuffle();
 
-    // Display
     if (cfg.fullscreen != g_fullscreen)
         toggleFullscreen();
 
@@ -1173,23 +1010,20 @@ static void applyConfig(const VibeusConfig& cfg)
     if (!g_debug)
         SDL_SetWindowTitle(g_window, "Vibeus");
 
-    // Motion
     g_speedMultiplier = cfg.speedMultiplier;
     g_flowMode = cfg.flowMode;
 
-    // Performance Mode - affects VSync. Mesh resolution comes from Mesh Detail.
     switch (cfg.perfMode) {
         case PerfMode::BatterySaver:
-            SDL_GL_SetSwapInterval(0);  // No VSync
+            SDL_GL_SetSwapInterval(0);
             break;
         case PerfMode::Balanced:
         case PerfMode::Quality:
         default:
-            SDL_GL_SetSwapInterval(1);  // VSync on
+            SDL_GL_SetSwapInterval(1);
             break;
     }
 
-    // UI scale (base 1.35 * user factor)
     ImGui::GetIO().FontGlobalScale = 1.35f * cfg.fontScale;
 }
 
@@ -1232,8 +1066,6 @@ static bool findPlaylistPositionByPath(projectm_playlist_handle playlist,
     return false;
 }
 
-// ----- Handle Menu Actions -----
-
 static void handleMenuAction(MenuAction action)
 {
     switch (action) {
@@ -1257,18 +1089,15 @@ static void handleMenuAction(MenuAction action)
 
     case MenuAction::BrowsePresets:
         g_menu.loadPresetList(g_presets.handle());
-        g_menu.setPresetDatabase(&g_presetDb);   // enable category browsing
+        g_menu.setPresetDatabase(&g_presetDb);
 
-        // Sync favorites from config.json into the UI (path-based persistence)
         {
-            g_menu.loadFavorites(g_favoritesPath); // legacy .txt support
+            g_menu.loadFavorites(g_favoritesPath);
 
-            // New: populate m_favorites from favoritePresetPaths in config (simple O(n) scan)
             for (const auto& path : g_config.favoritePresetPaths) {
-                // Scan a safe range; PresetDatabase internally knows its size
                 for (uint32_t i = 0; i < 20000; ++i) {
                     const ::PresetEntry* pe = g_presetDb.getPreset(i);
-                    if (!pe) break; // end of list
+                    if (!pe) break;
                     if (pe->fullPath == path) {
                         g_menu.toggleFavorite(i);
                         break;
@@ -1291,16 +1120,17 @@ static void handleMenuAction(MenuAction action)
             break;
         }
 
-        projectm_playlist_set_position(g_presets.handle(), playlistPos, true);
+        // Use abstraction for preset change
+        if (g_visualizer) {
+            g_visualizer->setPreset(playlistPos, true);
+        }
         fprintf(stderr, "[Vibeus] Playing preset #%u via path: %s\n", playlistPos, selectedPath.c_str());
-        // If we were in main menu, start the visualizer
         if (g_appState == AppState::MainMenu) {
             g_appState = AppState::Visualizer;
             g_menu.hideAll();
             g_paused = false;
             g_lastFrameTicks = SDL_GetTicks();
         }
-        // If paused, resume
         else if (g_paused) {
             resumeFromPause();
             g_menu.hideAll();
@@ -1309,7 +1139,6 @@ static void handleMenuAction(MenuAction action)
     }
 
     case MenuAction::BackToPause:
-        // Save favorites before leaving browser
         {
             g_menu.saveFavorites(g_favoritesPath);
         }
@@ -1317,7 +1146,6 @@ static void handleMenuAction(MenuAction action)
         break;
 
     case MenuAction::ShowControls:
-        // Open Settings and jump directly to the Controls tab (index 4)
         if (g_appState == AppState::Visualizer && g_paused)
             g_menu.setSettingsReturnScreen(UIScreen::PauseMenu);
         else
@@ -1327,7 +1155,6 @@ static void handleMenuAction(MenuAction action)
         break;
 
     case MenuAction::Settings:
-        // Remember where we came from so Back returns correctly
         if (g_appState == AppState::Visualizer && g_paused)
             g_menu.setSettingsReturnScreen(UIScreen::PauseMenu);
         else
@@ -1340,7 +1167,6 @@ static void handleMenuAction(MenuAction action)
         break;
 
     case MenuAction::ExitToDesktop:
-        // Save favorites on exit
         {
             g_menu.saveFavorites(g_favoritesPath);
         }
@@ -1349,15 +1175,12 @@ static void handleMenuAction(MenuAction action)
         break;
 
     case MenuAction::ApplySettings:
-        // Apply in real-time (no disk save — that happens on Back)
         applyConfig(g_config);
         g_menu.showToast("Settings applied");
         break;
 
     case MenuAction::ApplyTransitionSettings:
-        // Force immediate push of transition / hardcut / storyteller settings
         applyConfig(g_config);
-        // Also push storyteller settings right now so the new mode takes effect instantly
         {
             StorySettings ss{};
             ss.transitionStyle     = g_config.storyTransitionStyle;
@@ -1381,11 +1204,9 @@ static void handleMenuAction(MenuAction action)
         applyConfig(g_config);
         saveConfig(g_config, g_configPath);
         g_menu.showToast("Settings saved");
-        // Return to the screen that opened settings
         {
             UIScreen returnTo = g_menu.settingsReturnScreen();
             g_menu.showScreen(returnTo);
-            // If returning to pause menu, re-render frozen frames for backdrop
             if (returnTo == UIScreen::PauseMenu)
                 g_pauseRenderCount = 0;
         }
@@ -1395,18 +1216,14 @@ static void handleMenuAction(MenuAction action)
         break;
     }
 
-    // Also save favorites when returning to main menu from browser
     if (action == MenuAction::BackToMenu &&
         g_menu.currentScreen() == UIScreen::MainMenu) {
         g_menu.saveFavorites(g_favoritesPath);
     }
 }
 
-// ----- Main -----
-
 int main(int argc, char* argv[])
 {
-    // Check for --debug flag
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--debug") == 0 || strcmp(argv[i], "-d") == 0)
             g_debug = true;
@@ -1417,14 +1234,12 @@ int main(int argc, char* argv[])
         attachConsole();
 #endif
 
-    // Resolve per-user writable paths as early as possible so installed-build crashes are diagnosable.
     g_userDataDir = getUserDataDir();
     g_configPath = (fs::path(g_userDataDir) / "vibeus_config.json").string();
     g_favoritesPath = (fs::path(g_userDataDir) / "favorites.txt").string();
     g_brokenPresetBlacklistPath = (fs::path(g_userDataDir) / "broken_presets.txt").string();
     g_userBlacklistPath = (fs::path(g_userDataDir) / "blacklisted_presets.txt").string();
 
-    // If running without a debug console (typical installed build), write logs to a user-writable file.
     if (!g_debug) {
         std::string logPath = (fs::path(g_userDataDir) / "vibeus_debug.log").string();
         FILE* dummy;
@@ -1434,57 +1249,47 @@ int main(int argc, char* argv[])
         setvbuf(stdout, nullptr, _IONBF, 0);
     }
 
-    fprintf(stderr, "=== Vibeus v0.2.3-dev ===\n");
+    fprintf(stderr, "=== Vibeus v0.2.3-dev (ABSTRACTION MIGRATION) ===\n");
     if (g_debug)
         fprintf(stderr, "[DEBUG MODE ENABLED]\n");
     fprintf(stderr, "[Vibeus] User data dir: %s\n\n", g_userDataDir.c_str());
 
-    // Load user configuration early (safe: per-user AppData path)
     g_config = loadConfig(g_configPath);
     if (!fs::exists(g_configPath))
         saveConfig(g_config, g_configPath);
 
-    // 1. Initialize SDL + OpenGL
     if (!initSDL()) return 1;
     fprintf(stderr, "[Vibeus] SDL2 + OpenGL 3.3 context ready\n");
 
-    // 2. Set up projectM logging
     if (g_debug) {
-        projectm_set_log_level(PROJECTM_LOG_LEVEL_DEBUG, false);
-    } else {
-        projectm_set_log_level(PROJECTM_LOG_LEVEL_WARN, false);
+        if (auto* pmViz = dynamic_cast<ProjectMVisualizer*>(g_visualizer.get())) {
+            // Will be set after init
+        }
     }
-    projectm_set_log_callback(projectmLogCallback, false, nullptr);
 
-    // 3. Initialize projectM
-    if (!initProjectM()) {
+    if (!initVisualizer()) {
         SDL_GL_DeleteContext(g_glCtx);
         SDL_DestroyWindow(g_window);
         SDL_Quit();
         return 1;
     }
 
-    // 4. Initialize audio capture
     if (!g_audio.init()) {
         fprintf(stderr, "[Vibeus] WARNING: Audio capture failed - visuals won't react to music\n");
     }
 
-    // 5. Load presets
     std::string presetsDir = findPresetsDir();
     fprintf(stderr, "[Vibeus] Presets directory: %s\n", presetsDir.c_str());
-    g_presets.init(g_pm, presetsDir);
+    g_presets.init(g_visualizer ? g_visualizer->getHandle() : nullptr, presetsDir);
 
-    // 8. Apply blacklists (fast)
     g_presets.applyBlacklist(g_brokenPresetBlacklistPath);
     g_presets.applyBlacklist(g_userBlacklistPath);
 
     fprintf(stderr, "\n[Vibeus] Ready! %u presets loaded. Shuffle: %s\n",
             g_presets.count(), g_presets.isShuffled() ? "ON" : "OFF");
 
-    // Initialize storyteller
-    g_storyteller.init(g_pm, &g_presets);
+    g_storyteller.init(g_visualizer ? g_visualizer->getHandle() : nullptr, &g_presets);
 
-    // 9. Validate and filter broken presets (if enabled)
     if (g_config.validatePresetsOnStartup) {
         fprintf(stderr, "\n[Vibeus] Validating presets for shader errors...\n");
         fprintf(stderr, "[Vibeus] This may take a few minutes on first run.\n");
@@ -1522,33 +1327,26 @@ int main(int argc, char* argv[])
     fprintf(stderr, "  Tab=flow mode  Esc=pause menu  Q=quit\n");
     fprintf(stderr, "  Gamepad: A=next B=prev X=random Y=shuffle Start=pause\n\n");
 
-    // 8. Initialize menu overlay
     if (!g_menu.init(g_window, g_glCtx)) {
         fprintf(stderr, "[Vibeus] WARNING: Menu overlay init failed\n");
     }
     g_menu.setConfigPtr(&g_config);
     g_menu.setUserDataDir(g_userDataDir);
 
-    // Apply saved config to all systems (except fullscreen on startup — handled by config value)
     {
-        // Sync config → globals without triggering fullscreen toggle at launch
         bool savedFullscreen = g_config.fullscreen;
-        g_config.fullscreen = g_fullscreen; // pretend it matches current state
+        g_config.fullscreen = g_fullscreen;
         applyConfig(g_config);
-        g_config.fullscreen = savedFullscreen; // restore for future use
-        // If user wants fullscreen on startup, toggle it now
+        g_config.fullscreen = savedFullscreen;
         if (savedFullscreen && !g_fullscreen)
             toggleFullscreen();
     }
 
-    // 9. Try to open gamepad
     tryOpenGamepad();
 
-    // 9. Start with epilepsy splash screen
     g_appState = AppState::Splash;
     g_menu.showScreen(UIScreen::Splash);
 
-    // 10. Main render loop
     Uint32 frameDelay = 1000 / TARGET_FPS;
     g_fpsTimer = SDL_GetTicks();
     g_lastFrameTicks = g_fpsTimer;
@@ -1556,10 +1354,8 @@ int main(int argc, char* argv[])
     while (g_running) {
         Uint32 frameStart = SDL_GetTicks();
 
-        // Process input
         processEvents();
 
-        // Reset GL state before projectM renders (ImGui may leave dirty state)
         static auto pfnBindFramebuffer = reinterpret_cast<void(APIENTRY*)(GLenum, GLuint)>(
             SDL_GL_GetProcAddress("glBindFramebuffer"));
         if (pfnBindFramebuffer)
@@ -1568,38 +1364,25 @@ int main(int argc, char* argv[])
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-        // State-specific rendering
         switch (g_appState) {
         case AppState::Splash:
         case AppState::MainMenu:
-            // Render a single projectM frame as eye-candy background
             if (g_appState == AppState::MainMenu || g_appState == AppState::Splash) {
-                // Slowly advance time for subtle background animation
                 static double menuBgTime = 0.0;
-                menuBgTime += 0.016 * 0.3; // 30% speed
-                projectm_set_frame_time(g_pm, menuBgTime);
-                g_audio.feedAudio(g_pm, 0.3f); // low audio reactivity for bg
-                projectm_opengl_render_frame(g_pm);
+                menuBgTime += 0.016 * 0.3;
+                if (g_visualizer) g_visualizer->setFrameTime(menuBgTime);
+                g_audio.feedAudio(g_visualizer.get(), 0.3f);
+                if (g_visualizer) g_visualizer->renderFrame();
             }
             break;
 
         case AppState::Visualizer: {
-            // Settings overlay keeps the visualizer running live
             bool settingsLive = g_paused &&
                                 g_menu.currentScreen() == UIScreen::Settings;
             if (!g_paused || settingsLive) {
-                // Process analog gamepad input
                 processGamepad();
-                // Process flow mode (mouse-driven manipulation) [DISABLED]
-                // processFlowMode();
-                // Process expanding ripple rings [DISABLED]
-                // processRipples();
-                // Update virtual time after stasis detection below. In stasis we
-                // deliberately hold frame time steady so silence feels frozen.
 
-                // ── Stasis detection (freeze when no audio) ──
                 static float silenceTimer = 0.0f;
-                // g_inStasis is the global used by Live Status header
                 const float rms = g_audio.levelRms();
                 const float deltaTime = 1.0f / (g_currentFps > 10.0f ? g_currentFps : 60.0f);
 
@@ -1614,7 +1397,6 @@ int main(int argc, char* argv[])
                         }
                     } else {
                         if (g_inStasis) {
-                            // Waking up from stasis
                             fprintf(stderr,
                                     "[Stasis] Exited silence freeze (rms=%.4f threshold=%.4f)\n",
                                     rms, g_config.stasisThreshold);
@@ -1631,19 +1413,14 @@ int main(int argc, char* argv[])
                     g_inStasis = false;
                 }
 
-                // Hold visual time steady in stasis; otherwise advance according to
-                // speed/reduced-motion controls. Keep g_lastFrameTicks fresh while
-                // frozen so exiting stasis does not accumulate a huge delta.
                 if (g_inStasis) {
                     g_lastFrameTicks = SDL_GetTicks();
-                    projectm_set_frame_time(g_pm, g_virtualTime);
+                    if (g_visualizer) g_visualizer->setFrameTime(g_virtualTime);
                 } else {
                     updateVirtualTime(SDL_GetTicks());
                 }
 
-                // Storyteller analysis (if enabled and not in stasis)
                 if (g_config.storytellingEnabled && !g_inStasis) {
-                    // Push tunable settings from config → storyteller each frame
                     StorySettings ss;
                     ss.dropSensitivity   = g_config.storyDropSensitivity;
                     ss.bassReactivity    = g_config.storyBassReactivity;
@@ -1668,48 +1445,35 @@ int main(int argc, char* argv[])
                                          g_audio.levelBeatHigh(),
                                          deltaTime);
                 } else if (g_inStasis) {
-                    // In stasis: freeze storyteller and kill beat reactivity
-                    setBeatSensitivity(0.0f, "stasis");
+                    if (g_visualizer) g_visualizer->setBeatSensitivity(0.0f);
                 }
 
-                // Safety clamp — prevents any accidental runaway sensitivity
-                // (this was the cause of "gets insanely fast after a while")
-                float currentSens = projectm_get_beat_sensitivity(g_pm);
+                float currentSens = g_visualizer ? g_visualizer->getBeatSensitivity() : 1.0f;
                 if (currentSens > 3.0f) {
-                    // Aggressive reset — something escaped the storyteller clamps
                     setBeatSensitivity(2.0f, "safety-reset");
                     fprintf(stderr, "[Safety] Runaway sensitivity detected (%.1f) — reset to 2.0\n", currentSens);
                 }
 
-                // Capture audio and feed to projectM (with gain applied)
-                // Flash limiter caps gain to 1.0 to reduce rapid brightness spikes
                 float effectiveGain = (g_flashLimiter && g_audioGain > 1.0f) ? 1.0f : g_audioGain;
-                g_audio.feedAudio(g_pm, effectiveGain);
+                g_audio.feedAudio(g_visualizer.get(), effectiveGain);
 
-                // Beat reactivity control: if user disabled adaptive beat, force fixed sensitivity.
-                // The storyteller is now the single source of truth for dynamic sensitivity.
-                // (We removed the per-frame reactivity multiplier because it was causing
-                // unbounded compounding → "visuals go 100000x fast" after a few minutes.)
                 if (!g_inStasis && !g_config.adaptiveBeat) {
                     float fixedSens = g_config.beatSensitivity;
                     setBeatSensitivity(fixedSens, "non-adaptive");
                 }
-                // Render visualization frame
-                projectm_opengl_render_frame(g_pm);
+                if (g_visualizer) g_visualizer->renderFrame();
 
-                // Beat detection: use band-limited kick energy + flux with adaptive floor
-                const float bassEnergy = g_audio.levelBeatBass(); // <150Hz kick band
+                const float bassEnergy = g_audio.levelBeatBass();
                 const float rmsEnergy  = g_audio.levelRms();
 
-                static float bassAvg = 0.0f;     // slow-moving floor
-                static float fluxAvg = 0.0f;     // onset sensitivity
+                static float bassAvg = 0.0f;
+                static float fluxAvg = 0.0f;
                 static float prevBass = 0.0f;
-                static int   beatCooldown = 0;   // frame countdown to avoid rapid re-triggers
+                static int   beatCooldown = 0;
 
                 if (beatCooldown > 0)
                     beatCooldown--;
 
-                // Apply user-configurable beat hold time (hysteresis)
                 static int lastHoldFrames = 0;
                 int targetHoldFrames = static_cast<int>(g_config.beatHoldTime * (g_currentFps > 10.0f ? g_currentFps : 60.0f));
                 if (targetHoldFrames != lastHoldFrames) {
@@ -1719,41 +1483,39 @@ int main(int argc, char* argv[])
                 float flux = (std::max)(0.0f, bassEnergy - prevBass);
                 prevBass = bassEnergy;
 
-                // Update adaptive baselines (decays quickly on quiet passages)
                 bassAvg = bassAvg * 0.96f + bassEnergy * 0.04f;
                 fluxAvg = fluxAvg * 0.90f + flux * 0.10f;
 
                 const float dynamicFloor     = (std::max)(0.01f, bassAvg * 0.8f + rmsEnergy * 0.05f);
-                const float fluxGate         = 0.0015f + fluxAvg * 0.20f;                // lenient gate
-                const float strongFluxGate   = fluxAvg * 1.6f + 0.010f;                  // high-transient catch
+                const float fluxGate         = 0.0015f + fluxAvg * 0.20f;
+                const float strongFluxGate   = fluxAvg * 1.6f + 0.010f;
                 const float dynamicThreshold = dynamicFloor * 1.15f + fluxAvg * 0.65f + 0.010f;
 
                 const bool fluxHit     = (flux >= fluxGate);
-                const bool fluxStrong  = (flux >= strongFluxGate);                       // sneaky drop path
+                const bool fluxStrong  = (flux >= strongFluxGate);
                 const bool bassHit     = (bassEnergy >= dynamicThreshold);
-                const bool bassJump    = (bassEnergy >= dynamicFloor * 2.0f);            // guard loud choruses
+                const bool bassJump    = (bassEnergy >= dynamicFloor * 2.0f);
                 const bool fluxOnlyHit = fluxStrong && (bassEnergy >= dynamicFloor * 0.8f);
 
                 if (beatCooldown == 0 && ( (bassHit && fluxHit) || bassJump || fluxOnlyHit )) {
                     g_beatIndicatorAlpha = 1.0f;
 
-                    // Use user-configurable hold time (hysteresis) instead of hardcoded 180ms
                     float holdSec = (g_config.beatHoldTime > 0.01f) ? g_config.beatHoldTime : 0.18f;
                     beatCooldown = static_cast<int>((g_currentFps > 10.0f ? g_currentFps : 60.0f) * holdSec);
                     if (beatCooldown < 6) beatCooldown = 6;
                 }
 
-                // Fade out indicator
                 if (g_beatIndicatorAlpha > 0.0f) {
                     float deltaTime = 1.0f / (g_currentFps > 0.0f ? g_currentFps : 60.0f);
                     g_beatIndicatorAlpha -= deltaTime * 4.0f;
                     if (g_beatIndicatorAlpha < 0.0f) g_beatIndicatorAlpha = 0.0f;
                 }
             } else {
-                // While paused, render a few frozen frames then stop
                 if (g_pauseRenderCount < 3) {
-                    projectm_set_frame_time(g_pm, g_pausedTime);
-                    projectm_opengl_render_frame(g_pm);
+                    if (g_visualizer) {
+                        g_visualizer->setFrameTime(g_pausedTime);
+                        g_visualizer->renderFrame();
+                    }
                     g_pauseRenderCount++;
                 }
             }
@@ -1761,9 +1523,7 @@ int main(int argc, char* argv[])
         }
         }
 
-        // Render UI overlay if visible (draws on top of everything)
         if (g_menu.isVisible()) {
-            // Push live storyteller + preset status to the menu for the "Live Status" header
             const char* stateStr = (g_storyteller.currentState() == StoryState::Chill)   ? "CHILL" :
                                    (g_storyteller.currentState() == StoryState::Buildup) ? "BUILD" :
                                    (g_storyteller.currentState() == StoryState::Drop)    ? "DROP"  : "SUSTAIN";
@@ -1775,12 +1535,10 @@ int main(int argc, char* argv[])
                 handleMenuAction(action);
         }
 
-        // Render custom beat indicator if active
         if (g_appState == AppState::Visualizer && g_showBeatIndicator && g_beatIndicatorAlpha > 0.0f) {
             g_menu.renderBeatIndicator(g_beatIndicatorAlpha);
         }
 
-        // Storyteller HUD overlay (state + ratio/flux)
         if (g_appState == AppState::Visualizer && g_config.storytellingEnabled && g_config.storyDebug) {
             const char* s = (g_storyteller.currentState() == StoryState::Chill)   ? "CHILL" :
                             (g_storyteller.currentState() == StoryState::Buildup) ? "BUILD" :
@@ -1788,12 +1546,10 @@ int main(int argc, char* argv[])
             g_menu.renderStoryOverlay(s, g_storyteller.lastEnergyRatio(), g_storyteller.spectralFlux());
         }
 
-        // Always render toasts (even when menu is hidden)
         g_menu.renderToasts();
 
         SDL_GL_SwapWindow(g_window);
 
-        // FPS tracking
         g_frameCount++;
         Uint32 now = SDL_GetTicks();
         if (now - g_fpsTimer >= 1000) {
@@ -1804,17 +1560,14 @@ int main(int argc, char* argv[])
                 updateDebugTitle();
         }
 
-        // Frame rate limiter
         Uint32 elapsed = SDL_GetTicks() - frameStart;
         if (elapsed < frameDelay) {
             SDL_Delay(frameDelay - elapsed);
         }
     }
 
-    // 11. Cleanup
     fprintf(stderr, "\n[Vibeus] Shutting down...\n");
 
-    // Persist user data on ANY exit path (window close, Q key, etc.)
     g_menu.saveFavorites(g_favoritesPath);
     saveConfig(g_config, g_configPath);
 
@@ -1824,8 +1577,10 @@ int main(int argc, char* argv[])
         SDL_GameControllerClose(g_gamepad);
         g_gamepad = nullptr;
     }
-    projectm_destroy(g_pm);
-    g_pm = nullptr;
+    if (g_visualizer) {
+        g_visualizer->shutdown();
+        g_visualizer.reset();
+    }
 
     SDL_GL_DeleteContext(g_glCtx);
     SDL_DestroyWindow(g_window);
