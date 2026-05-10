@@ -101,4 +101,10 @@ private:
 
     // Debug
     int m_logLevel = 2; // 2=warn
+
+    // Mode helpers
+    void drawClassicMode(float intensity, float flash);
+    void drawNebulaMode(float intensity);
+    void drawTunnelMode(float intensity);
+    void drawSymmetryMode(float intensity);
 };
