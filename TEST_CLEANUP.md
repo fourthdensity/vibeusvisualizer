@@ -1,1 +1,0 @@
-This is a test file to clean up the repo. The migration is complete.
