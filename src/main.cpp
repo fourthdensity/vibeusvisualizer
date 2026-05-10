@@ -522,9 +522,13 @@ static bool initSDL()
 // Updated init to use abstraction layer
 static bool initVisualizer()
 {
-    // Default to ProjectM for full compatibility
-    // To use custom backend: g_visualizer = std::make_unique<VibeusVisualizer>();
+#ifdef USE_PROJECTM_BACKEND
+    // Optional legacy ProjectM backend (requires -DUSE_PROJECTM=ON in CMake)
     g_visualizer = std::make_unique<ProjectMVisualizer>();
+#else
+    // Default: custom VibeusVisualizer (no ProjectM dependency)
+    g_visualizer = std::make_unique<VibeusVisualizer>();
+#endif
     
     if (!g_visualizer->initialize(DEFAULT_WIDTH, DEFAULT_HEIGHT)) {
         fprintf(stderr, "[Vibeus] Visualizer initialization failed\n");

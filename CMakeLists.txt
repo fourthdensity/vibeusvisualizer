@@ -20,8 +20,8 @@ find_package(imgui CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
 # --- Visualization Backend Selection ---
-option(USE_PROJECTM "Use ProjectM as the visualization backend" ON)
-option(USE_VIBEUS_BACKEND "Use Vibeus custom visualization backend" OFF)
+option(USE_PROJECTM "Use ProjectM as the visualization backend (legacy, requires projectM built from source)" OFF)
+option(USE_VIBEUS_BACKEND "Use Vibeus custom visualization backend" ON)
 
 if(USE_PROJECTM)
     # projectM - point to the built library
